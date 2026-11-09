@@ -1,0 +1,299 @@
+# Fork-only build of the Apple Silicon (ARM64) DMG.
+#
+# Builds a commit of the FSRS7 fork (JSchoreels/anki by default) on a
+# GitHub-hosted Apple Silicon runner and publishes the DMG as a release of this
+# repository. It lives in its own file so that pulling upstream changes never
+# conflicts with it; release.yml stays untouched.
+#
+# - Scheduled runs build upstream main when it has a commit with no release here
+#   yet. If upstream CI already failed for it, the run skips it; if CI is still
+#   running, the build starts anyway and only publishing waits for CI.
+# - Manual runs can build any repository/ref, skip the CI gate, force a rebuild,
+#   or fall back to the macos-15 image.
+#
+# Builds are ad-hoc signed, not notarized. A browser download gets quarantined
+# by Gatekeeper; downloading with `gh release download` does not.
+#
+# Release tags are "<.version>.g<commit>", e.g. 26.09.3+fsrs7.g34399e7. The
+# app's update check (rslib/src/backend/github.rs) still reads JSchoreels/anki
+# releases. With this suffix, upstream ".build.N" releases of the same base
+# version compare as older, so only a new base version (e.g. 26.10) prompts.
+
+name: macOS ARM64 build
+run-name: "macOS ARM64 build of ${{ inputs['source-repo'] || 'JSchoreels/anki' }}@${{ inputs['source-ref'] || 'main' }}"
+
+on:
+  schedule:
+    # Only the few-second resolve job runs unless upstream main has moved.
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      source-repo:
+        description: "Repository to build"
+        default: JSchoreels/anki
+        required: true
+        type: string
+      source-ref:
+        description: "Branch, tag or commit to build"
+        default: main
+        required: true
+        type: string
+      wait-for-ci:
+        description: "Publish only after the source repository's CI passes on this commit"
+        default: true
+        type: boolean
+      force:
+        description: "Build and publish even if this commit already has a release"
+        default: false
+        type: boolean
+      runner:
+        description: "macOS runner image"
+        default: macos-26
+        type: choice
+        options:
+          - macos-26
+          - macos-15
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ${{ inputs['source-repo'] || 'JSchoreels/anki' }}
+  SOURCE_REF: ${{ inputs['source-ref'] || 'main' }}
+  N2_OUTPUT_PROGRESS: "1"
+  N2_OUTPUT_SUCCESS: "1"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.resolve.outputs.build }}
+      ci: ${{ steps.resolve.outputs.ci }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve commit, release tag and CI state
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_FOR_CI: ${{ github.event_name == 'schedule' || inputs['wait-for-ci'] }}
+          FORCE: ${{ inputs.force == true }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
+        run: |
+          set -euo pipefail
+
+          sha=$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_REF" --jq .sha)
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve $SOURCE_REPO@$SOURCE_REF"
+            exit 1
+          fi
+
+          version=$(gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/$SOURCE_REPO/contents/.version?ref=$sha" | tr -d '[:space:]')
+          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+]*$ ]]; then
+            echo "::error::Unexpected .version '$version' at $SOURCE_REPO@$sha"
+            exit 1
+          fi
+
+          # The tag doubles as the app's artifact version, which the update
+          # check parses as PEP 440, so the commit goes in the local label.
+          if [[ "$version" == *+* ]]; then
+            tag="$version.g${sha:0:7}"
+          else
+            tag="$version+g${sha:0:7}"
+          fi
+
+          build=true
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$FORCE" = true ]; then
+              tag="$tag.r$GITHUB_RUN_NUMBER"
+            else
+              echo "::notice::$tag is already released; nothing to build (use force to rebuild)"
+              build=false
+            fi
+          fi
+
+          ci=skipped
+          if [ "$build" = true ] && [ "$WAIT_FOR_CI" = true ]; then
+            # Same run selection as .github/scripts/wait_for_ci.py: the newest
+            # push or workflow_dispatch run of ci.yml for this commit.
+            state=$(gh run list --repo "$SOURCE_REPO" --workflow ci.yml --commit "$sha" \
+              --limit 10 --json event,status,conclusion \
+              --jq '[.[] | select(.event == "push" or .event == "workflow_dispatch")][0] // {}
+                | "\(.status // "none")/\(.conclusion // "")"')
+            case "$state" in
+              completed/success)
+                ci=passed
+                ;;
+              completed/*)
+                if [ "$SCHEDULED" = true ]; then
+                  echo "::notice::Skipping $sha: $SOURCE_REPO CI ended with '${state#completed/}'"
+                  build=false
+                  ci=failed
+                else
+                  echo "::error::$SOURCE_REPO CI ended with '${state#completed/}' for $sha; run again with wait-for-ci off to build it anyway"
+                  exit 1
+                fi
+                ;;
+              *)
+                ci=pending
+                ;;
+            esac
+          fi
+
+          {
+            echo "### macOS ARM64 build"
+            echo
+            echo "- Source: [$SOURCE_REPO@${sha:0:9}](https://github.com/$SOURCE_REPO/commit/$sha)"
+            echo "- Release tag: \`$tag\`"
+            echo "- Build: $build"
+            echo "- Upstream CI: $ci"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "sha=$sha"
+            echo "tag=$tag"
+            echo "build=$build"
+            echo "ci=$ci"
+          } >> "$GITHUB_OUTPUT"
+
+  # Runs alongside the build when upstream CI had not finished at resolve time.
+  ci:
+    needs: resolve
+    if: needs.resolve.outputs.ci == 'pending'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Wait for source repository CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: python3 .github/scripts/wait_for_ci.py --repo "$SOURCE_REPO" --commit "$SHA"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 90
+    env:
+      ANKI_ARTIFACT_VERSION: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      # On a cold runner, compiling n2 and the build tools takes ~3.5 minutes,
+      # and the Rust dependencies are most of the rest of the Rust build. The key
+      # covers what invalidates compiled dependencies; changed workspace crates
+      # are rebuilt as usual. Restored before setup-anki, whose n2 install step
+      # skips when n2 is already on PATH.
+      - name: Restore Rust build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/n2
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            out/rust
+          key: macos-arm64-release-${{ inputs.runner || 'macos-26' }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'tools/install-n2') }}
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-anki
+
+      - name: Build installer
+        run: just macos-installer
+
+      - name: Check installer
+        run: |
+          shopt -s nullglob
+          dmgs=(out/installer/dist/*-mac-apple.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::Expected one Apple Silicon DMG, found: ${dmgs[*]:-none}"
+            ls -l out/installer/dist || true
+            exit 1
+          fi
+          echo "Built ${dmgs[0]} ($(du -h "${dmgs[0]}" | cut -f1))"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: installer-macos-arm64
+          path: out/installer/dist/*-mac-apple.dmg
+          if-no-files-found: error
+          compression-level: 0 # a DMG is already compressed
+          retention-days: 7
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        if: failure()
+        with:
+          name: logs-installer-macos-arm64
+          path: out/installer/logs/
+          retention-days: 7
+
+  publish:
+    needs: [resolve, ci, build]
+    if: >-
+      ${{ !cancelled()
+      && needs.build.result == 'success'
+      && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: installer-macos-arm64
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          CI_STATE: ${{ needs.resolve.outputs.ci == 'skipped' && 'not checked' || 'passed' }}
+        run: |
+          set -euo pipefail
+
+          # Source commit of the previous build, for a compare link.
+          prev=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --json tagName \
+            --jq '[.[].tagName | capture("[.+]g(?<sha>[0-9a-f]{7})(\\.r[0-9]+)?$") | .sha][0] // ""')
+
+          {
+            echo "Apple Silicon build of [$SOURCE_REPO@${SHA:0:9}](https://github.com/$SOURCE_REPO/commit/$SHA)."
+            if [ -n "$prev" ] && [ "$prev" != "${SHA:0:7}" ]; then
+              echo
+              echo "Changes since the previous build: https://github.com/$SOURCE_REPO/compare/$prev...$SHA"
+            fi
+            echo
+            echo "Upstream CI: $CI_STATE. Ad-hoc signed and not notarized. Download it without"
+            echo "the Gatekeeper quarantine that a browser download gets:"
+            echo
+            echo '```'
+            echo "gh release download '$TAG' --repo $GITHUB_REPOSITORY --pattern '*-mac-apple.dmg'"
+            echo '```'
+            echo
+            echo "The tag marks the commit of this repository that ran the build; the source"
+            echo "commit is the one linked above."
+          } > notes.md
+
+          gh release create "$TAG" dist/*-mac-apple.dmg \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Anki $TAG" \
+            --notes-file notes.md \
+            --latest
+
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$(jq -rn --arg t "$TAG" '$t|@uri')" >> "$GITHUB_STEP_SUMMARY"
