@@ -147,6 +147,115 @@ fn sm57_vectors() -> Vec<u8> {
     }
 }
 
+/// The show-time instant-only model, stage 2 (SM98): show-time inputs, as
+/// sm92 (the vectors carry each row's own interval). Its curve head is
+/// untrained but still part of the network the vectors check.
+fn sm98_vectors() -> Vec<u8> {
+    if let Ok(path) = std::env::var("ANKI_RWKV_SM98_VECTORS") {
+        fs::read(path).unwrap()
+    } else {
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&include_bytes!("testdata/sm98-vectors.json.gz")[..])
+            .read_to_end(&mut data)
+            .unwrap();
+        data
+    }
+}
+
+/// The smaller instant-only model (SM101), the Tiny choice: SM98 with one
+/// card layer, same show-time inputs (its vectors' inputs equal SM98's).
+fn sm101_vectors() -> Vec<u8> {
+    if let Ok(path) = std::env::var("ANKI_RWKV_SM101_VECTORS") {
+        fs::read(path).unwrap()
+    } else {
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&include_bytes!("testdata/sm101-vectors.json.gz")[..])
+            .read_to_end(&mut data)
+            .unwrap();
+        data
+    }
+}
+
+#[test]
+fn rwkv_sm101_matches_published_vectors() {
+    check_published_vectors("sm101", &sm101_vectors());
+}
+
+#[test]
+fn rwkv_sm101_ignores_missing_id_flags_in_every_inference_path() {
+    check_ignores_missing_id_flags("sm101", &sm101_vectors());
+}
+
+#[test]
+fn rwkv_sm101_feature_builder_matches_show_time_intervals() {
+    check_show_time_intervals("sm101", &sm101_vectors());
+}
+
+/// The Tiny two-head model (SM106), the Tiny choice's one model: the tiny
+/// plan (one card layer) with a trained curve head, show-time inputs (its
+/// vectors' inputs equal SM101's).
+fn sm106_vectors() -> Vec<u8> {
+    if let Ok(path) = std::env::var("ANKI_RWKV_SM106_VECTORS") {
+        fs::read(path).unwrap()
+    } else {
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&include_bytes!("testdata/sm106-vectors.json.gz")[..])
+            .read_to_end(&mut data)
+            .unwrap();
+        data
+    }
+}
+
+#[test]
+fn rwkv_sm106_matches_published_vectors() {
+    check_published_vectors("sm106", &sm106_vectors());
+}
+
+#[test]
+fn rwkv_sm106_ignores_missing_id_flags_in_every_inference_path() {
+    check_ignores_missing_id_flags("sm106", &sm106_vectors());
+}
+
+#[test]
+fn rwkv_sm106_feature_builder_matches_show_time_intervals() {
+    check_show_time_intervals("sm106", &sm106_vectors());
+}
+
+/// The small engine reads the card layers from the weights: one for SM101,
+/// two for every other small model, at f32 and INT8 weights.
+#[test]
+fn rwkv_small_engine_reads_card_layers_from_the_weights() {
+    for package in [
+        "sm40v2", "sm36", "sm55", "sm56", "sm72", "sm72e20", "sm72e25", "sm92", "sm57", "sm98",
+        "sm101", "sm106",
+    ] {
+        for format in ["f32", "int8"] {
+            let model = SrsModel::load(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../qt/aqt/rwkv_inference/{package}/weights.{format}.bin"
+            )))
+            .unwrap();
+            let plan = if matches!(package, "sm101" | "sm106") {
+                TINY_LAYER_PLAN
+            } else {
+                ENGINE_LAYER_PLAN
+            };
+            assert_eq!(model.layer_plan, plan, "{package} {format}");
+            let layers: Vec<_> = model.modules.iter().map(|m| m.layers.len()).collect();
+            assert_eq!(layers, plan.module_layers, "{package} {format}");
+        }
+    }
+}
+
+#[test]
+fn rwkv_sm98_matches_published_vectors() {
+    check_published_vectors("sm98", &sm98_vectors());
+}
+
+#[test]
+fn rwkv_sm98_ignores_missing_id_flags_in_every_inference_path() {
+    check_ignores_missing_id_flags("sm98", &sm98_vectors());
+}
+
 #[test]
 fn rwkv_sm57_matches_published_vectors() {
     check_published_vectors("sm57", &sm57_vectors());
@@ -210,13 +319,26 @@ fn rwkv_sm92_ignores_missing_id_flags_in_every_inference_path() {
 /// (features 0..8) of every query and answer row.
 #[test]
 fn rwkv_sm92_feature_builder_matches_show_time_intervals() {
-    let vectors: Vec<Vectors> = serde_json::from_slice(&sm92_vectors()).unwrap();
+    check_show_time_intervals("sm92", &sm92_vectors());
+}
+
+/// The show-time instant-only model, stage 2 (SM98) was trained on the same
+/// show-time intervals as the show-time retrain (SM92).
+#[test]
+fn rwkv_sm98_feature_builder_matches_show_time_intervals() {
+    check_show_time_intervals("sm98", &sm98_vectors());
+}
+
+fn check_show_time_intervals(package: &str, data: &[u8]) {
+    let vectors: Vec<Vectors> = serde_json::from_slice(data).unwrap();
     let mut maximum = 0.0_f32;
     let mut queries = 0;
     for user in &vectors {
         let mut features = FeatureState::default();
         for (index, row) in user.rows.iter().enumerate() {
-            let [seconds, days] = row.interval.expect("sm92 vectors carry the row intervals");
+            let [seconds, days] = row
+                .interval
+                .expect("show-time vectors carry the row intervals");
             let mut input = vector_input(row);
             input.current_elapsed_seconds = Some(seconds as i64);
             input.current_elapsed_days = Some(days as i64);
@@ -237,7 +359,7 @@ fn rwkv_sm92_feature_builder_matches_show_time_intervals() {
         }
     }
     assert!(queries > 0);
-    println!("sm92 interval features: {queries} queries, maximum absolute error {maximum}");
+    println!("{package} interval features: {queries} queries, maximum absolute error {maximum}");
 }
 
 fn check_ignores_missing_id_flags(package: &str, data: &[u8]) {
@@ -367,20 +489,27 @@ fn rwkv_sm40_spec_matches_compiled_architecture() {
         include_str!("../../../qt/aqt/rwkv_inference/sm72e25/architecture.json"),
         include_str!("../../../qt/aqt/rwkv_inference/sm92/architecture.json"),
         include_str!("../../../qt/aqt/rwkv_inference/sm57/architecture.json"),
+        include_str!("../../../qt/aqt/rwkv_inference/sm98/architecture.json"),
     ] {
-        check_compiled_architecture(source);
+        check_compiled_architecture(source, ENGINE_LAYER_PLAN);
+    }
+    for source in [
+        include_str!("../../../qt/aqt/rwkv_inference/sm101/architecture.json"),
+        include_str!("../../../qt/aqt/rwkv_inference/sm106/architecture.json"),
+    ] {
+        check_compiled_architecture(source, TINY_LAYER_PLAN);
     }
 }
 
-fn check_compiled_architecture(source: &str) {
+fn check_compiled_architecture(source: &str, plan: LayerPlan) {
     let spec: serde_json::Value = serde_json::from_str(source).unwrap();
     assert_eq!(spec["d_model"], D_MODEL);
     assert_eq!(spec["head_fc_dim"], HEAD_DIM);
     assert_eq!(spec["num_curves"], NUM_CURVES);
     for id in 0..5 {
-        assert_eq!(spec["streams"][id]["n_layers"], MODULE_LAYERS[id]);
+        assert_eq!(spec["streams"][id]["n_layers"], plan.module_layers[id]);
         assert_eq!(spec["streams"][id]["head_size"], HEAD_SIZE);
-        for layer in 0..MODULE_LAYERS[id] {
+        for layer in 0..plan.module_layers[id] {
             let stripped = spec["streams"][id]["channel_mixer_stripped_layers"]
                 .as_array()
                 .unwrap()
@@ -389,7 +518,7 @@ fn check_compiled_architecture(source: &str) {
         }
     }
     let steps: Vec<(usize, usize)> = serde_json::from_value(spec["layer_steps"].clone()).unwrap();
-    assert_eq!(steps, LAYER_STEPS);
+    assert_eq!(steps, plan.steps);
 }
 
 #[derive(serde::Deserialize)]

@@ -14,6 +14,7 @@ import {
     RwkvProfileSettings,
     UpdateDeckConfigsRequest,
 } from "@generated/anki/deck_config_pb";
+import { Bool } from "@generated/anki/generic_pb";
 import {
     RwkvComparisonOptions_Learner,
     RwkvComparisonOptions_PerformanceScenario,
@@ -24,6 +25,34 @@ import {
 
 import { expect, test } from "./fixtures";
 import { decodeRequestBody } from "./helpers";
+
+test("RWKV comparison explains that it needs RWKV-Curve on an instant-only runtime", async ({ page }) => {
+    let started = 0;
+    await page.route("**/_anki/getDeckConfigsForUpdate", async (route) => {
+        const response = await route.fetch();
+        const data = DeckConfigsForUpdate.fromBinary(await response.body());
+        data.allConfig.find((entry) => entry.config!.id === data.currentDeck!.configId)!
+            .config!.config!.rwkvReviewEnabled = true;
+        await route.fulfill({ response, body: Buffer.from(data.toBinary()) });
+    });
+    await page.route("**/_anki/rwkvWorkloadAvailable", async (route) => {
+        await route.fulfill({ body: Buffer.from(new Bool({ val: false }).toBinary()) });
+    });
+    await page.route("**/_anki/startRwkvWorkload", async (route) => {
+        started += 1;
+        await route.fulfill({ body: Buffer.alloc(0) });
+    });
+    await page.goto("/deck-options/1");
+    const card = page.getByRole("heading", { name: "RWKV", exact: true }).locator("../..");
+    await card.locator("details.rwkv-advanced summary").click();
+    await card.getByRole("button", { name: "Compare RWKV with FSRS", exact: true }).click();
+    const comparison = page.getByRole("dialog").filter({
+        has: page.getByRole("heading", { name: "FSRS / RWKV Efficiency Comparison (Experimental)", exact: true }),
+    });
+    await expect(comparison.getByText(/RWKV workload simulation needs RWKV-Curve\./)).toBeVisible();
+    await expect(comparison.getByRole("button", { name: "Simulate", exact: true })).toBeDisabled();
+    expect(started).toBe(0);
+});
 
 test("RWKV comparison sends the selected shared learner and scenario", async ({ page }) => {
     let submitted: SimulateFsrsReviewRequest | undefined;
@@ -237,7 +266,14 @@ test(
         const advanced = card.locator("details.rwkv-advanced");
         const openAdvanced = advanced.locator("summary");
         const group = advanced.getByRole("region", { name: "Prediction model", exact: true });
-        const model = group.getByRole("checkbox", { name: "Use Smaller Model", exact: true });
+        const big = group.getByRole("radio", { name: "Big", exact: true });
+        const small = group.getByRole("radio", { name: "Small", exact: true });
+        const tiny = group.getByRole("radio", { name: "Tiny", exact: true });
+        const singleModel = group.getByRole("checkbox", {
+            name: "Use one model for RWKV (about half the memory, slightly worse RWKV-Instant predictions)",
+            exact: true,
+        });
+        const model = big;
         const compare = advanced.getByRole("button", { name: "Compare RWKV with FSRS", exact: true });
         await expect(model).toBeHidden();
         await expect(compare).toBeHidden();
@@ -252,7 +288,12 @@ test(
         await page.setViewportSize({ width: 1280, height: 900 });
         await openAdvanced.focus();
         await page.keyboard.press("Enter");
-        await expect(model).not.toBeChecked();
+        // The saved Big choice ("legacy"): one model, no opt-out.
+        await expect(big).toBeChecked();
+        await expect(small).not.toBeChecked();
+        await expect(tiny).not.toBeChecked();
+        await expect(singleModel).toHaveCount(0);
+        await expect(group.getByRole("radio")).toHaveCount(3);
         await expect(group.getByText("Legacy - Bigger Model", { exact: true })).toHaveCount(0);
         await expect(compare).toBeVisible();
         await compare.click();
@@ -263,8 +304,16 @@ test(
         await comparison.getByRole("button", { name: "Close", exact: true }).click();
         await expect(comparison).toBeHidden();
         await expect(group.getByRole("button", { name: "About prediction models", exact: true })).toHaveCount(0);
-        await expect(group.getByText("On — New - Smaller Model", { exact: true })).toBeVisible();
-        await expect(group.getByText("Off — Legacy - Bigger Model", { exact: true })).toBeVisible();
+        await expect(group.getByText("Use Smaller Model", { exact: true })).toHaveCount(0);
+        await expect(group).toContainText("Uses the most memory and takes the longest");
+        await expect(group).toContainText("Much less memory and faster than Big");
+        await expect(group).toContainText(
+            "RWKV-Curve uses the same model as Small; with the one-model setting, Tiny runs one tiny model for both instead",
+        );
+        // Short descriptions without internal model IDs.
+        for (const description of await group.locator(".size-description").allTextContents()) {
+            expect(description).not.toMatch(/SM\d/);
+        }
         await expect(group).toContainText("Applies to all decks in this profile on this computer");
         await expect(group.getByRole("link", { name: "Model Factory results" })).toHaveAttribute(
             "href",
@@ -274,7 +323,8 @@ test(
             "href",
             "https://github.com/JSchoreels/anki/blob/main/docs/rwkv-sm56-2026-10-24.MD#matched-native-backup-check",
         );
-        await model.check();
+        await tiny.check();
+        await expect(singleModel).toBeVisible();
         await page.setViewportSize({ width: 736, height: 1000 });
         await card.screenshot({ path: testInfo.outputPath("rwkv-options-advanced.png") });
         await page.evaluate(() => document.documentElement.classList.add("night-mode"));
@@ -283,27 +333,67 @@ test(
         expect(saved).toBeUndefined();
         await page.reload();
         await openAdvanced.click();
-        await expect(model).not.toBeChecked();
-        await model.check();
-        await page.getByRole("button", { name: "Save", exact: true }).click();
-        await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({
-            model: "sm72e25",
-            statePrecision: "int8",
-        });
-        await page.reload();
-        await openAdvanced.click();
         await expect(model).toBeChecked();
-        await model.uncheck();
-        await page.getByRole("button", { name: "Save", exact: true }).click();
-        await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({ model: "legacy", statePrecision: "int8" });
-        await page.reload();
-        await openAdvanced.click();
-        await expect(model).not.toBeChecked();
+        // Big -> Small -> Tiny -> Big, each saved and reloaded.
+        for (
+            const [radio, value, opt_out] of [
+                [small, "sm72e25", true],
+                [tiny, "tiny", true],
+                [big, "legacy", false],
+            ] as const
+        ) {
+            await radio.check();
+            await page.getByRole("button", { name: "Save", exact: true }).click();
+            await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({
+                model: value,
+                statePrecision: "int8",
+            });
+            await page.reload();
+            await openAdvanced.click();
+            await expect(radio).toBeChecked();
+            await expect(singleModel).toHaveCount(opt_out ? 1 : 0);
+        }
     },
 );
 
+test("RWKV keeps a saved SM92 choice as a fourth option until another size is picked", async ({ page }) => {
+    let saved: UpdateDeckConfigsRequest | undefined;
+    await page.route("**/_anki/getDeckConfigsForUpdate", async (route) => {
+        const response = await route.fetch();
+        const data = DeckConfigsForUpdate.fromBinary(await response.body());
+        data.allConfig.find((entry) => entry.config!.id === data.currentDeck!.configId)!
+            .config!.config!.rwkvReviewInstantOrderEnabled = true;
+        data.rwkvProfileSettings = new RwkvProfileSettings(
+            saved?.rwkvProfileSettings ?? { model: "sm92", statePrecision: "f32" },
+        );
+        await route.fulfill({ response, body: Buffer.from(data.toBinary()) });
+    });
+    await page.route("**/_anki/updateDeckConfigsAndClose", async (route) => {
+        saved = decodeRequestBody(route.request(), UpdateDeckConfigsRequest);
+        await route.fulfill({ body: Buffer.from(new OpChanges().toBinary()) });
+    });
+    await page.goto("/deck-options/1");
+    await page.locator("details.rwkv-advanced summary").click();
+    const group = page.getByRole("region", { name: "Prediction model", exact: true });
+    const kept = group.getByRole("radio", { name: "Show-time retrain of the release (SM92)", exact: true });
+    await expect(kept).toBeChecked();
+    await expect(group.getByRole("radio")).toHaveCount(4);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({ model: "sm92", statePrecision: "f32" });
+    await page.reload();
+    await page.locator("details.rwkv-advanced summary").click();
+    await group.getByRole("radio", { name: "Tiny", exact: true }).check();
+    await expect(kept).toBeHidden();
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({ model: "tiny", statePrecision: "f32" });
+    await page.reload();
+    await page.locator("details.rwkv-advanced summary").click();
+    await expect(group.getByRole("radio", { name: "Tiny", exact: true })).toBeChecked();
+    await expect(group.getByRole("radio")).toHaveCount(3);
+});
+
 for (const model of ["sm40", "sm36", "sm55", "sm56", "sm72", "sm72e20"]) {
-    test(`saving older RWKV model ${model} chooses SM72 (cool-down from epoch 25) without changing hidden precision`, async ({ page }) => {
+    test(`saving older RWKV model ${model} chooses Small without changing hidden precision`, async ({ page }) => {
         let saved: UpdateDeckConfigsRequest | undefined;
         await page.route("**/_anki/getDeckConfigsForUpdate", async (route) => {
             const response = await route.fetch();
@@ -326,7 +416,7 @@ for (const model of ["sm40", "sm36", "sm55", "sm56", "sm72", "sm72e20"]) {
         await expect.poll(() => saved?.rwkvProfileSettings).toMatchObject({ model: "sm72e25", statePrecision: "f32" });
         await page.reload();
         await page.locator("details.rwkv-advanced summary").click();
-        await expect(page.getByRole("checkbox", { name: "Use Smaller Model", exact: true })).toBeChecked();
+        await expect(page.getByRole("radio", { name: "Small", exact: true })).toBeChecked();
     });
 }
 
