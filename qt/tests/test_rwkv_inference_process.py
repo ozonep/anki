@@ -7,7 +7,9 @@ import importlib
 import importlib.util
 import math
 import struct
+from concurrent.futures import Future
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -491,6 +493,80 @@ def _import_rsbridge(root: Path) -> object:
     return module
 
 
+def test_rsbridge_rwkv_queue_scoring_returns_an_exception_for_invalid_state(
+    monkeypatch, caplog
+) -> None:
+    from aqt import rwkv_scheduler
+    from aqt.reviewer import Reviewer
+
+    root = Path(__file__).resolve().parents[2]
+    rsbridge = _import_rsbridge(root)
+    model_path = root / "qt/aqt/rwkv_inference" / _RWKV_MODEL_FILENAME
+    runtime = rsbridge.RwkvInference(
+        str(model_path),
+        0.9,
+        36500,
+        state_precision="cards_int4_notes_int8",
+        model="sm40",
+    )
+    invalid_answer = {**_RWKV_REVIEWS[0], "duration": -10}
+
+    def input_row(review, *, is_query):
+        return (
+            *_rwkv_review_args(
+                review,
+                is_query=is_query,
+                card_state=None,
+                note_state=None,
+                deck_state=None,
+                preset_state=None,
+                global_state=None,
+            )[:15],
+            True,
+        )
+
+    runtime.warm_up_reviews([input_row(invalid_answer, is_query=False)], False)
+
+    with pytest.raises(Exception, match="RWKV card state:.*non-finite shift"):
+        runtime.predict_retrievability_many_from_warm_up(
+            [input_row(invalid_answer, is_query=True)]
+        )
+
+    class Taskman:
+        def run_in_background(self, task, on_done, **_kwargs):
+            future = Future()
+            try:
+                future.set_result(task())
+            except Exception as error:
+                future.set_exception(error)
+            on_done(future)
+
+    completed = []
+    reviewer = Reviewer.__new__(Reviewer)
+    reviewer.card = SimpleNamespace(id=invalid_answer["card_id"])
+    reviewer.mw = SimpleNamespace(taskman=Taskman())
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "prepare_reviewer_queue_order_async_work",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        rwkv_scheduler,
+        "score_reviewer_queue_order_async_work",
+        lambda *_args, **_kwargs: runtime.predict_retrievability_many_from_warm_up(
+            [input_row(invalid_answer, is_query=True)]
+        ),
+    )
+
+    reviewer._prepare_rwkv_queue_order_async(on_finished=completed.append)
+
+    assert completed == [False]
+    assert reviewer._rwkv_queue_refresh_in_flight is False
+    assert (
+        "RWKV card state: invalid RWKV compact state: non-finite shift" in caplog.text
+    )
+
+
 def _load_rsbridge_runtime(
     rsbridge: object, root: Path, model_name: str, filename: str, state_precision: str
 ) -> object:
@@ -778,6 +854,46 @@ def test_rsbridge_rwkv_predictions_survive_state_and_workload_roundtrips(
     assert runtime.simulate_workload_from_warm_up(
         workload_inputs, *workload_settings
     ) == runtime.simulate_workload(workload_inputs, snapshot, *workload_settings)
+    # One seed-0 forecast path at 90% retention replays the DR simulation's
+    # 90% target: the same answers, review count and cost.
+    forecast_inputs = [(workload_inputs[0], None, 7, 0.9, 0, None, (), 0.9)]
+    forecast_settings = (
+        [(7, 10, 0, 0, 0)],
+        5,
+        1,
+        0,
+        9999,
+        0,
+        False,
+        36500,
+        0,
+        None,
+        1,
+        False,
+        (8.0, 8.0, 8.0, 8.0),
+        [],
+        None,
+    )
+    simulated_points = runtime.simulate_workload_from_warm_up(
+        workload_inputs, *workload_settings
+    )[2]
+    paths, days, groups, estimated = runtime.forecast_workload_from_warm_up(
+        forecast_inputs, *forecast_settings
+    )
+    assert paths == 1 and estimated == 0 and len(days) == 5
+    point_90 = next(point for point in simulated_points if point[0] == 90)
+    assert sum(day[2][0] + day[3][0] for day in days) == point_90[4]
+    assert sum(day[5][0] for day in days) == pytest.approx(point_90[3])
+    assert groups[0][0] == 7 and len(groups[0][1]) == 5
+    banded = runtime.forecast_workload_from_warm_up(
+        forecast_inputs, forecast_settings[0], 5, 9, *forecast_settings[3:]
+    )
+    assert banded[0] == 9
+    for day in banded[1]:
+        for band in day[1:]:
+            mean, p1, p5, p50, p95, p99 = band
+            assert p1 <= p5 <= p50 <= p95 <= p99
+            assert p1 <= mean <= p99
     answer_inputs = []
     for ease in (1, 2, 3, 4):
         answer_input = list(query_input)

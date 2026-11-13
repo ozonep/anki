@@ -743,6 +743,19 @@ impl RwkvRuntime {
         })
     }
 
+    pub fn forecast_history_predictions(
+        &self,
+        reviews: Vec<ReviewInput>,
+        progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
+    ) -> io::Result<Vec<(usize, f32)>> {
+        dispatch!(
+            self,
+            engine,
+            engine.forecast_history_predictions(reviews, progress),
+            pair => pair.instant.forecast_history_predictions(reviews, progress)
+        )
+    }
+
     /// Replay answers and return each answer's immediate post-review
     /// prediction.
     pub fn warm_up_reviews_post(
@@ -1030,6 +1043,40 @@ impl RwkvRuntime {
             engine,
             engine.simulate_workload_from_warm_up(inputs, config, progress),
             pair => pair.release.simulate_workload_from_warm_up(inputs, config, progress)
+        )
+    }
+
+    /// The forecast schedules RWKV presets with the curve, so a paired runtime
+    /// runs it on the release model.
+    pub fn forecast_workload_from_warm_up(
+        &self,
+        inputs: Vec<RwkvForecastCard>,
+        config: RwkvWorkloadForecastConfig,
+        progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
+    ) -> io::Result<RwkvWorkloadForecastOutput> {
+        if self.is_instant_only() {
+            return Err(no_curve_model());
+        }
+        dispatch!(
+            self,
+            engine,
+            engine.forecast_workload_from_warm_up(inputs, config, progress),
+            pair => pair.release.forecast_workload_from_warm_up(inputs, config, progress)
+        )
+    }
+
+    pub fn forecast_instant_workload_from_warm_up(
+        &self,
+        inputs: Vec<RwkvInstantForecastCard>,
+        config: RwkvInstantForecastConfig,
+        progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
+        day_progress: &mut dyn FnMut(u32, u32, [f32; 5]) -> io::Result<()>,
+    ) -> io::Result<RwkvWorkloadForecastOutput> {
+        dispatch!(
+            self,
+            engine,
+            engine.forecast_instant_workload_from_warm_up(inputs, config, progress, day_progress),
+            pair => pair.instant.forecast_instant_workload_from_warm_up(inputs, config, progress, day_progress)
         )
     }
 
@@ -1823,6 +1870,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn instant_forecast_pulls_future_card_for_daily_minimum() {
+        if super::super::SMALL_MODEL {
+            check_instant_forecast_pulls_future_card(load(ModelKind::Sm57, StatePrecision::F32));
+        }
+        check_instant_forecast_pulls_future_card(load(ModelKind::Sm99, StatePrecision::F32));
+        check_instant_forecast_pulls_future_card(big_pair(StatePrecision::F32));
+    }
+
+    fn check_instant_forecast_pulls_future_card(mut runtime: RwkvRuntime) {
+        let answers = crate::rwkv::precision_tests::reviews(4);
+        runtime.warm_up_reviews(answers.clone(), false).unwrap();
+        let query = query_of(&answers[0], 3);
+        let mut deck = crate::decks::Deck::new_normal();
+        deck.id = crate::decks::DeckId(1);
+        deck.name = crate::decks::NativeDeckName::from_human_name("Study");
+        let mut preset = crate::deckconfig::DeckConfig {
+            id: crate::deckconfig::DeckConfigId(1),
+            ..Default::default()
+        };
+        preset.inner.rwkv_review_instant_order_enabled = true;
+        preset.inner.rwkv_review_minimum_reviews_per_day = 1;
+        preset.inner.reviews_per_day = 1;
+        let output = runtime
+            .forecast_instant_workload_from_warm_up(
+                vec![RwkvInstantForecastCard {
+                    input: RwkvWorkloadSimulationInput {
+                        review_input: query,
+                        interval_days: Some(30),
+                        ease_factor: Some(2500),
+                        reps: Some(3),
+                        lapses: Some(0),
+                    },
+                    due_day: 30,
+                    group: 1,
+                    desired_retention: 0.01,
+                    instant_enabled: true,
+                    intervening_reviews: None,
+                    last_kind_and_grade: None,
+                    queue: 2,
+                    learning_due_millis: 0,
+                    remaining_steps: 0,
+                    new_position: 0,
+                    fsrs_memory: None,
+                    fsrs_parameters: vec![],
+                    fsrs_historical_retention: 0.9,
+                    fsrs_enabled: false,
+                }],
+                RwkvInstantForecastConfig {
+                    days: 1,
+                    paths: 1,
+                    scenario_sigma: None,
+                    stratified_answers: false,
+                    stratified_scale: 1.0,
+                    stratified_bias_sd: 0.0,
+                    stratified_review_variance: 0.0,
+                    report_days: false,
+                    seed: 0,
+                    decks: vec![deck],
+                    deck_configs: vec![preset],
+                    study_deck_id: 1,
+                    today: 0,
+                    new_cards_ignore_review_limit: true,
+                    fsrs_learning_queues_disabled: false,
+                    fsrs_short_term_with_steps_enabled: true,
+                    learn_ahead_secs: 0,
+                    timing_patterns: vec![vec![(10_000, 2_000), (15_000, 3_000)]],
+                    timing_pattern_success_shares: vec![[0.0, 0.0, 1.0, 0.0]],
+                    review_time_model: None,
+                    now_millis: 0,
+                    same_day_allowed: false,
+                    min_intervening_reviews: 0,
+                    min_elapsed_secs: 0,
+                    refresh_interval: 1,
+                    approximate_refresh_answers: 0,
+                    candidate_refresh_enabled: false,
+                    candidate_refresh_limit: 64,
+                    precompute_next_card: true,
+                    review_order:
+                        anki_proto::deck_config::deck_config::config::ReviewCardOrder::Day,
+                    review_model: RwkvWorkloadReviewModel {
+                        grade_seconds: [1.0; 4],
+                        bucket_probabilities: Vec::new(),
+                    },
+                },
+                &mut |_, _| Ok(()),
+                &mut |_, _, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(output.days[0].done.mean, 1.0);
+    }
+
     /// An instant-only runtime against the same weights as a plain engine:
     /// the same instant outputs and states, no curve output, no simulation.
     fn check_instant_only_alone(mut alone: RwkvRuntime, mut raw: RwkvRuntime) {
@@ -1890,6 +2029,33 @@ mod tests {
         assert!(alone
             .simulate_workload_from_warm_up(Vec::new(), config(), &mut |_, _| Ok(()))
             .is_err());
+        let error = alone
+            .forecast_workload_from_warm_up(
+                Vec::new(),
+                RwkvWorkloadForecastConfig {
+                    days: 1,
+                    paths: 1,
+                    seed: 0,
+                    groups: Vec::new(),
+                    default_review_limit: 10,
+                    default_new_limit: 0,
+                    new_cards_ignore_review_limit: false,
+                    max_interval: 36_500,
+                    review_order:
+                        anki_proto::deck_config::deck_config::config::ReviewCardOrder::Day,
+                    suspend_after_lapses: None,
+                    state_update_interval: 1,
+                    single_step_answers: false,
+                    review_model: RwkvWorkloadReviewModel {
+                        grade_seconds: [1.0; 4],
+                        bucket_probabilities: Vec::new(),
+                    },
+                },
+                &mut |_, _| Ok(()),
+            )
+            .expect_err("an instant-only model cannot forecast with a curve");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("RWKV-Curve"));
     }
 
     fn read_u32(bytes: &[u8], at: &mut usize) -> usize {

@@ -394,7 +394,7 @@ def test_cache_replay_identity_tracks_active_model_until_profile_reopen(
         (True, False, False, RwkvRuntimeModels("sm101")),
         (True, False, True, RwkvRuntimeModels("sm101")),
         # Both: by default SM98 beside the release, which keeps curve,
-        # intervals, S90 and answer time; the opt-out shares the release.
+        # intervals, S90 and answer time; the opt-out uses SM92 alone.
         (True, True, False, RwkvRuntimeModels("sm72e25", "sm98")),
         (True, True, True, RwkvRuntimeModels("sm92")),
         # Only RWKV-Curve, or neither: the release alone.
