@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "ammonia"
-version = "4.1.8"
+version = "4.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f6660fb4ff692ef4937b1b4e74ab3d378653d8588389587d91f96a296907ea0"
+checksum = "935c841d86ee68ba89a983ea6e4255436f769ab1e2b701574653baf4b30739ce"
 dependencies = [
  "cssparser",
  "html5ever 0.39.0",
@@ -1360,7 +1360,7 @@ dependencies = [
 [[package]]
 name = "fsrs"
 version = "6.6.2"
-source = "git+https://github.com/JSchoreels/fsrs-rs.git?rev=49fe84eaaced63bc5382e2d19a6ec5160b9df772#49fe84eaaced63bc5382e2d19a6ec5160b9df772"
+source = "git+https://github.com/JSchoreels/fsrs-rs.git?rev=bd8932bb33d68bf0ac0e4367b154eec837f7fad2#bd8932bb33d68bf0ac0e4367b154eec837f7fad2"
 dependencies = [
  "bytemuck",
  "itertools 0.15.0",

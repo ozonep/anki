@@ -33,12 +33,18 @@ export type DeckOptionsId = bigint;
 export const RWKV_MODEL_BIG = "legacy";
 export const RWKV_MODEL_SMALL = "sm72e25";
 export const RWKV_MODEL_TINY = "tiny";
-/** Older small models: still run until a save, which stores Small instead. */
-export const RWKV_OLDER_SMALL_MODELS = ["sm40", "sm36", "sm55", "sm56", "sm72", "sm72e20"];
+/** Older small models (and the default small model (SM63) by its own value):
+ * still run until a save, which stores Small instead. */
+export const RWKV_OLDER_SMALL_MODELS = ["sm40", "sm36", "sm55", "sm56", "sm72", "sm72e20", "sm63"];
 
 export interface ConfigWithCount {
     config: DeckConfig;
     useCount: number;
+}
+
+export interface RwkvSchedulerUsage {
+    curve: boolean;
+    instant: boolean;
 }
 
 /** Info for showing the top selector */
@@ -90,6 +96,8 @@ type AllConfigs =
 export class DeckOptionsState {
     readonly currentConfig: Writable<DeckConfig_Config>;
     readonly rwkvProfileSettings: Writable<RwkvProfileSettings>;
+    readonly rwkvCollectionCounts: { cards: number; notes: number } | undefined;
+    readonly rwkvSchedulerUsage: Writable<RwkvSchedulerUsage> = writable({ curve: false, instant: false });
     readonly currentAuxData: Writable<Record<string, unknown>>;
     readonly configList: Readable<ConfigListEntry[]>;
     readonly cardStateCustomizer: Writable<string>;
@@ -141,6 +149,12 @@ export class DeckOptionsState {
                 statePrecision: "cards_int4_notes_int8",
             }),
         );
+        this.rwkvCollectionCounts = data.rwkvCollectionCounts
+            ? {
+                cards: Number(data.rwkvCollectionCounts.cards),
+                notes: Number(data.rwkvCollectionCounts.notes),
+            }
+            : undefined;
         this.defaults = data.defaults!.config!;
         this.configs = data.allConfig.map((config) => {
             const configInner = config.config!;
@@ -328,6 +342,7 @@ export class DeckOptionsState {
                 }
             }
         }
+        this.updateRwkvSchedulerUsage();
     }
 
     setCurrentName(name: string): void {
@@ -466,6 +481,14 @@ export class DeckOptionsState {
                 this.modifiedConfigs.add(configOuter.id);
             }
         }
+        this.updateRwkvSchedulerUsage();
+    }
+
+    private updateRwkvSchedulerUsage(): void {
+        this.rwkvSchedulerUsage.set({
+            curve: this.configs.some(({ config }) => config.config?.rwkvReviewEnabled),
+            instant: this.configs.some(({ config }) => config.config?.rwkvReviewInstantOrderEnabled),
+        });
     }
 
     private onCurrentAuxDataChanged(data: Record<string, unknown>): void {

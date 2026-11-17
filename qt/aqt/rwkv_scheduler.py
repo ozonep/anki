@@ -29,6 +29,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
@@ -53,15 +54,33 @@ from anki.consts import (
 from anki.decks import DeckTreeNode, FilteredDeckConfig
 from anki.scheduler.v3 import SchedulingState, SchedulingStates
 from anki.utils import ids2str
-from aqt.qt import QMessageBox, QWidget
+from aqt.qt import QMessageBox, QTimer, QWidget
 from aqt.rwkv_answer_time import (
     ANSWER_TIME_FEATURES,
     RwkvAnswerTimePrediction,
     answer_time_card_info_rows,
+    answer_time_recall_curve,
 )
 from aqt.rwkv_model import RwkvRuntimeModels
 
 logger = logging.getLogger(__name__)
+
+
+def debug_caller_chain(frames: Sequence[traceback.FrameSummary]) -> str:
+    """Format frames as `parentdir/file.py:line:func`, most recent first.
+
+    Meant for DEBUG logs that need to name who triggered expensive work
+    (often an add-on under `addons21/<id>/`). Pass
+    `traceback.extract_stack(limit=N)[:-1]` to skip the logging frame.
+    """
+
+    return " <- ".join(
+        f"{os.path.basename(os.path.dirname(frame.filename))}/"
+        f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+        for frame in reversed(frames)
+    )
+
+
 _T = TypeVar("_T")
 
 
@@ -4153,8 +4172,21 @@ def _temporary_reviewer_backend_operation(
 
 
 def configure_reviewer_backend_from_environment() -> bool:
+    import aqt
+
     with _reviewer_backend_state_lock:
-        if _reviewer_backend is not None:
+        pending = getattr(aqt.mw, "_rwkv_model_change_pending", None) is not None
+        if pending or _reviewer_backend is not None:
+            return not pending and _reviewer_backend is not None
+        assignment_generation = _reviewer_backend_assignment_generation
+
+    def install_backend(backend: RwkvReviewerBackend) -> bool:
+        with _reviewer_backend_state_lock:
+            if getattr(aqt.mw, "_rwkv_model_change_pending", None) is not None:
+                return False
+            if assignment_generation != _reviewer_backend_assignment_generation:
+                return _reviewer_backend is not None
+            set_reviewer_backend(backend)
             return True
 
     start = time.monotonic()
@@ -4181,14 +4213,14 @@ def configure_reviewer_backend_from_environment() -> bool:
         if benchmark_path:
             from aqt.rwkv_srs_benchmark import SrsBenchmarkRwkvReviewerBackend
 
-            set_reviewer_backend(
-                SrsBenchmarkRwkvReviewerBackend(
-                    benchmark_path=benchmark_path,
-                    model_path=model_path,
-                    device=device,
-                    dtype=dtype,
-                )
+            benchmark_backend = SrsBenchmarkRwkvReviewerBackend(
+                benchmark_path=benchmark_path,
+                model_path=model_path,
+                device=device,
+                dtype=dtype,
             )
+            if not install_backend(benchmark_backend):
+                return False
             logger.debug(
                 "RWKV scheduler backend configured: backend=%s elapsed_ms=%.1f",
                 type(_reviewer_backend).__name__,
@@ -4234,7 +4266,8 @@ def configure_reviewer_backend_from_environment() -> bool:
                 instant_model_path=instant_model_path,
                 instant_model=runtime_models.instant_model,
             )
-        set_reviewer_backend(backend)
+        if not install_backend(backend):
+            return False
         logger.debug(
             "RWKV scheduler backend configured: backend=%s elapsed_ms=%.1f",
             type(_reviewer_backend).__name__,
@@ -7068,7 +7101,7 @@ def _prepare_reviewer_backend_for_review(reviewer: object) -> bool:
     return _prepare_reviewer_backend_from_cache(reviewer)
 
 
-def _prepare_reviewer_backend_from_cache(
+def _prepare_reviewer_backend_from_cache(  # noqa: PLR0911
     reviewer: object,
     *,
     progress: RwkvStateCacheProgressCallback | None = None,
@@ -7096,6 +7129,7 @@ def _prepare_reviewer_backend_from_cache(
 
     _reviewer_backend_execution_lock.acquire()
     claimed = False
+    revalidated = False
     try:
         with _reviewer_backend_state_lock:
             col = _collection(reviewer)
@@ -7135,6 +7169,15 @@ def _prepare_reviewer_backend_from_cache(
 
         start = time.monotonic()
         try:
+            if _publish_revalidated_resident_reviewer_backend_state(
+                reviewer,
+                key,
+                warmup_generation,
+                is_current=is_current,
+                source="cache-prepare",
+            ):
+                revalidated = True
+                return True
             restored_identity = _restore_reviewer_backend_cache(
                 reviewer,
                 backend=backend,
@@ -7175,6 +7218,10 @@ def _prepare_reviewer_backend_from_cache(
             try:
                 if claimed:
                     _finish_reviewer_backend_warmup(key, warmup_generation)
+                if revalidated:
+                    # The restore path records the collection marker itself;
+                    # the in-place path does it once the claim is released.
+                    _refresh_ready_rwkv_state_cache_collection_mod(reviewer)
             finally:
                 _reviewer_backend_execution_lock.release()
 
@@ -8301,6 +8348,12 @@ def has_reviewer_backend() -> bool:
     return configure_reviewer_backend_from_environment()
 
 
+@dataclass(frozen=True)
+class RwkvCardInfo:
+    rows: list[tuple[str, str]]
+    answer_time_recall: list[tuple[int, float]] = field(default_factory=list)
+
+
 def rwkv_card_info_rows(
     *,
     reviewer: object,
@@ -8310,6 +8363,25 @@ def rwkv_card_info_rows(
     request_retry: Callable[[], None] | None = None,
     wait_for_backend: bool = False,
 ) -> list[tuple[str, str]]:
+    return rwkv_card_info(
+        reviewer=reviewer,
+        card=card,
+        fallback_source=fallback_source,
+        include_after_review=include_after_review,
+        request_retry=request_retry,
+        wait_for_backend=wait_for_backend,
+    ).rows
+
+
+def rwkv_card_info(
+    *,
+    reviewer: object,
+    card: object,
+    fallback_source: str,
+    include_after_review: bool = True,
+    request_retry: Callable[[], None] | None = None,
+    wait_for_backend: bool = False,
+) -> RwkvCardInfo:
     card_id = _card_id(card)
     if not rwkv_review_active(reviewer, card):
         diagnostics = current_reviewer_diagnostics(
@@ -8320,10 +8392,10 @@ def rwkv_card_info_rows(
         if diagnostics is not None:
             if card_id is not None:
                 _set_rwkv_card_info_score(reviewer, card_id, None)
-            return _card_info_diagnostic_rows(diagnostics)
+            return RwkvCardInfo(_card_info_diagnostic_rows(diagnostics))
         if card_id is not None:
             _set_rwkv_card_info_score(reviewer, card_id, None)
-        return []
+        return RwkvCardInfo([])
 
     if _reviewer_backend is None:
         configure_reviewer_backend_from_environment()
@@ -8349,15 +8421,15 @@ def rwkv_card_info_rows(
     diagnostics = _with_card_info_prediction_details(diagnostics)
 
     rows = _card_info_diagnostic_rows(diagnostics)
+    answer_time = None
     if queried_diagnostics is not None and diagnostics.retrievability is not None:
-        rows.extend(
-            _rwkv_card_info_answer_time_rows(
-                reviewer,
-                card,
-                candidate=candidate,
-                wait_for_backend=wait_for_backend,
-            )
+        answer_time = _rwkv_card_info_answer_time_prediction(
+            reviewer,
+            card,
+            candidate=candidate,
+            wait_for_backend=wait_for_backend,
         )
+        rows.extend(answer_time_card_info_rows(answer_time))
     if rwkv_review_enabled(reviewer, card) and _rwkv_runtime_has_curve():
         rows.extend(
             _rwkv_card_info_next_s90_rows(
@@ -8375,16 +8447,19 @@ def rwkv_card_info_rows(
                 wait_for_backend=wait_for_backend,
             )
         )
-    return rows
+    return RwkvCardInfo(
+        rows,
+        answer_time_recall_curve(answer_time, diagnostics.button_probabilities),
+    )
 
 
-def _rwkv_card_info_answer_time_rows(
+def _rwkv_card_info_answer_time_prediction(
     reviewer: object,
     card: object,
     *,
     candidate: RwkvReviewCandidate,
     wait_for_backend: bool,
-) -> list[tuple[str, str]]:
+) -> RwkvAnswerTimePrediction | None:
     """Predicted answer times from the model's optional answer-time head; no
     rows without the head, for a card last reviewed today or a new card."""
     backend = _reviewer_backend
@@ -8392,22 +8467,22 @@ def _rwkv_card_info_answer_time_rows(
     has_head = getattr(backend, "has_answer_time_head", None)
     predict = getattr(backend, "predict_answer_time", None)
     if card_id is None or not callable(has_head) or not callable(predict):
-        return []
+        return None
     if not _rwkv_runtime_has_curve():
         # The head reads the release's state; an instant-only model has none.
-        return []
+        return None
     try:
         if not has_head() or not _prepare_reviewer_backend_for_card_info(reviewer):
-            return []
+            return None
         features = _rwkv_answer_time_history_features(reviewer, card_id)
         if features is None:
-            return []
+            return None
         state_token = _capture_reviewer_backend_prediction_state_token(
             reviewer,
             expected_backend=backend,
         )
         if state_token is None:
-            return []
+            return None
         with _try_reviewer_backend_prediction_access(
             expected_state_token=state_token,
             wait_timeout_seconds=(
@@ -8415,12 +8490,12 @@ def _rwkv_card_info_answer_time_rows(
             ),
         ) as current_backend:
             if current_backend is not backend:
-                return []
+                return None
             prediction = predict(candidate, features)
     except Exception:
         logger.debug("RWKV card info answer time unavailable", exc_info=True)
-        return []
-    return answer_time_card_info_rows(prediction)
+        return None
+    return prediction
 
 
 _rwkv_answer_time_history_cache: tuple[tuple[object, ...], list[float]] | None = None
@@ -10726,6 +10801,54 @@ def _revalidate_resident_reviewer_backend_state(
         return None
 
 
+def _publish_revalidated_resident_reviewer_backend_state(
+    reviewer: object,
+    key: tuple[int, int],
+    warmup_generation: int,
+    *,
+    is_current: Callable[[], bool],
+    source: str,
+) -> bool:
+    """Publish the resident state in place when its candidate is still exact.
+
+    The caller holds the execution lock and has claimed `warmup_generation`.
+    Returns False (with the candidate dropped) when there is nothing to reuse
+    or publication was superseded, so the caller falls back to its restore.
+    Raises `_ReviewerBackendWarmupInvalidated` when the claim went stale.
+    """
+
+    start = time.monotonic()
+    identity = _revalidate_resident_reviewer_backend_state(
+        reviewer, key, warmup_generation
+    )
+    if identity is None:
+        return False
+    if not is_current():
+        with _reviewer_backend_state_lock:
+            _reviewer_backend_revalidation_candidates.pop(key, None)
+        raise _ReviewerBackendWarmupInvalidated
+    if _publish_reviewer_backend_state(
+        key,
+        identity,
+        expected_generation=warmup_generation,
+        reviewer=reviewer,
+    ):
+        logger.debug(
+            "RWKV resident state revalidated in place: source=%s elapsed_ms=%.1f",
+            source,
+            (time.monotonic() - start) * 1000,
+        )
+        return True
+    with _reviewer_backend_state_lock:
+        _reviewer_backend_revalidation_candidates.pop(key, None)
+    logger.debug(
+        "RWKV resident state revalidation skipped: reason=publication superseded "
+        "source=%s",
+        source,
+    )
+    return False
+
+
 def _warm_up_reviewer_backend(  # noqa: PLR0911
     reviewer: object,
     *,
@@ -10776,32 +10899,19 @@ def _warm_up_reviewer_backend(  # noqa: PLR0911
     revalidated = False
     full_warm_up_completed = False
     try:
-        if not force_rebuild and not discard_resident_state:
-            identity = _revalidate_resident_reviewer_backend_state(
-                reviewer, key, warmup_generation
+        if (
+            not force_rebuild
+            and not discard_resident_state
+            and _publish_revalidated_resident_reviewer_backend_state(
+                reviewer,
+                key,
+                warmup_generation,
+                is_current=is_current,
+                source="warm-up",
             )
-            if identity is not None:
-                if not is_current():
-                    with _reviewer_backend_state_lock:
-                        _reviewer_backend_revalidation_candidates.pop(key, None)
-                    raise _ReviewerBackendWarmupInvalidated
-                if _publish_reviewer_backend_state(
-                    key,
-                    identity,
-                    expected_generation=warmup_generation,
-                    reviewer=reviewer,
-                ):
-                    revalidated = True
-                    logger.debug(
-                        "RWKV resident state revalidated in place: elapsed_ms=%.1f",
-                        (time.monotonic() - start) * 1000,
-                    )
-                    return True
-                with _reviewer_backend_state_lock:
-                    _reviewer_backend_revalidation_candidates.pop(key, None)
-                logger.debug(
-                    "RWKV resident state revalidation skipped: reason=publication superseded"
-                )
+        ):
+            revalidated = True
+            return True
         if revalidate_only:
             return False
         _drop_reviewer_backend_revalidation_candidates(backend)
@@ -12661,10 +12771,125 @@ def prepare_rwkv_state_cache_on_startup(mw: object) -> None:
     finish_rwkv_state_cache_startup(mw)
 
 
+def rwkv_profile_models_did_change(
+    mw: object, *, previous_profile: Mapping[str, object]
+) -> None:
+    """Offer to rebuild when saved profile settings select different models."""
+    from aqt.rwkv_srs_benchmark import EmbeddedRwkvReviewerBackend
+
+    target = _rwkv_runtime_models_for_profile(mw)
+    config_state = _rwkv_collection_config_state(SimpleNamespace(mw=mw))
+    with _reviewer_backend_state_lock:
+        backend = _reviewer_backend
+        if backend is not None and not isinstance(backend, EmbeddedRwkvReviewerBackend):
+            return
+        if backend is None:
+            active = _rwkv_runtime_models_for_profile(mw, profile=previous_profile)
+        else:
+            active = RwkvRuntimeModels(backend.model_name, backend.instant_model_name)
+        if active == target:
+            return
+        if not config_state.review_enabled:
+            if backend is not None:
+                set_reviewer_backend(None)
+            return
+
+        pending = object()
+        setattr(mw, "_rwkv_model_change_pending", pending)
+        set_reviewer_backend(None)
+
+    collection = _collection(SimpleNamespace(mw=mw))
+    decision_made = False
+
+    def is_current() -> bool:
+        return (
+            getattr(mw, "_rwkv_model_change_pending", None) is pending
+            and _collection(SimpleNamespace(mw=mw)) is collection
+        )
+
+    def on_choice(choice: int, *, resume: bool = False) -> None:
+        nonlocal decision_made
+        if not is_current():
+            return
+        if not resume:
+            if decision_made:
+                return
+            decision_made = True
+        if choice not in (0, 1):
+            setattr(mw, "_rwkv_model_change_pending", None)
+            mark_rwkv_state_declined(mw, source="model change prompt")
+            if not getattr(mw, "_rwkv_state_cache_loading", False):
+                _finish_rwkv_state_cache_operation(
+                    mw, ready=False, prewarm_reason="model change declined"
+                )
+            return
+        if getattr(mw, "_rwkv_state_cache_loading", False):
+            callbacks: list[Callable[[bool], None]] = getattr(
+                mw, "_rwkv_state_cache_completion_callbacks", []
+            )
+            callbacks.append(lambda _ready: on_choice(choice, resume=True))
+            setattr(mw, "_rwkv_state_cache_completion_callbacks", callbacks)
+            return
+
+        setattr(mw, "_rwkv_model_change_pending", None)
+
+        def refresh_review(ready: bool) -> None:
+            if (
+                ready
+                and getattr(mw, "state", None) == "review"
+                and _collection(SimpleNamespace(mw=mw)) is collection
+            ):
+                getattr(mw, "reviewer").op_executed(
+                    collection_pb2.OpChanges(study_queues=True), None, focused=True
+                )
+
+        build_rwkv_state_cache_with_progress(
+            mw,
+            force_rebuild=True,
+            record_retrievability_cache=choice == 1,
+            on_done=refresh_review,
+        )
+
+    def prompt() -> None:
+        if not is_current():
+            if getattr(mw, "_rwkv_model_change_pending", None) is pending:
+                setattr(mw, "_rwkv_model_change_pending", None)
+            return
+        from aqt.utils import ask_user_dialog
+
+        app = getattr(mw, "app", None)
+        active_modal = getattr(app, "activeModalWidget", lambda: None)()
+        parent = cast(QWidget, active_modal or mw)
+        dialog = ask_user_dialog(
+            "The RWKV model has changed. Build its state from review history now?\n\n"
+            "If you cancel, RWKV state will be unavailable until "
+            "you build it, for example with Build Cache in Deck Options.",
+            callback=on_choice,
+            buttons=[
+                "Build State Only",
+                "Build State + Calibration Data",
+                QMessageBox.StandardButton.Cancel,
+            ],
+            default_button=0,
+            parent=parent,
+            title="RWKV State Cache",
+        )
+        dialog.setEscapeButton(QMessageBox.StandardButton.Cancel)
+        # Button callbacks can run after finished; defer the close fallback so
+        # it does not override a selected build option.
+        dialog.finished.connect(
+            lambda _result: QTimer.singleShot(0, lambda: on_choice(2))
+        )
+
+    # The save operation must finish closing or updating Deck Options first.
+    QTimer.singleShot(0, prompt)
+
+
 def begin_rwkv_state_cache_startup(mw: object) -> None:
     """Invalidate resident state before startup sync can change the collection."""
 
     _invalidate_reviewer_backend_runtime_state_for_profile_open()
+    setattr(mw, "_rwkv_model_change_pending", None)
     from aqt.rwkv_precision import state_precision_for_profile
     from aqt.rwkv_srs_benchmark import EmbeddedRwkvReviewerBackend
 
@@ -12799,10 +13024,10 @@ def _show_rwkv_state_cache_prompt(mw: object) -> None:
 def rwkv_state_cache_loading(mw: object) -> bool:
     """Return whether count preparation must wait for RWKV state restoration."""
 
-    if getattr(mw, "_rwkv_state_cache_loading", False) or getattr(
-        mw,
-        "_rwkv_state_cache_recovery_scheduled",
-        False,
+    if (
+        getattr(mw, "_rwkv_model_change_pending", None) is not None
+        or getattr(mw, "_rwkv_state_cache_loading", False)
+        or getattr(mw, "_rwkv_state_cache_recovery_scheduled", False)
     ):
         return True
     return _reviewer_backend_warmup_pending(SimpleNamespace(mw=mw))
@@ -12846,6 +13071,8 @@ def request_rwkv_state_cache_recovery(
 ) -> bool:
     """Schedule one visible canonical recovery when resident RWKV state is cold."""
 
+    if getattr(mw, "_rwkv_model_change_pending", None) is not None:
+        return False
     reviewer = SimpleNamespace(mw=mw)
     collection = _collection(reviewer)
     if not _rwkv_collection_config_state(reviewer).review_enabled:
@@ -12894,6 +13121,8 @@ def request_rwkv_state_cache_recovery(
 
     def start_recovery() -> None:
         _set_rwkv_state_cache_recovery_scheduled(mw, False)
+        if getattr(mw, "_rwkv_model_change_pending", None) is not None:
+            return
         allowed_states: tuple[str, ...] = ("deckBrowser", "overview")
         if allow_during_review:
             allowed_states += ("review",)
@@ -16579,6 +16808,366 @@ def cancel_rwkv_workload_forecast(job_id: int) -> None:
         job = _rwkv_workload_forecast_jobs.get(int(job_id))
     if job is not None:
         job.cancel.set()
+
+
+_RWKV_RECALL_PROJECTION_DEFAULT_SEARCH = "is:review -is:learn -is:suspended -is:buried"
+_RWKV_RECALL_PROJECTION_MAX_OFFSETS = 16
+_RWKV_RECALL_PROJECTION_MAX_OFFSET_SECONDS = 0xFFFF_FFFF
+_RWKV_RECALL_PROJECTION_CANCEL_POLL_SECS = 0.05
+_rwkv_recall_projection_lock = threading.Lock()
+_rwkv_recall_projection_in_flight: dict[
+    tuple[object, ...], Future[dict[str, object]]
+] = {}
+
+
+def rwkv_recall_projection_available(mw: object | None = None) -> bool:
+    """Capability check for add-ons: True when this build and the current
+    RWKV backend can run `project_rwkv_recall`."""
+
+    del mw
+    return (
+        configure_reviewer_backend_from_environment() and _reviewer_backend is not None
+    )
+
+
+def _rwkv_recall_projection_offsets(
+    offsets_seconds: Sequence[int | None],
+) -> tuple[int | None, ...]:
+    offsets = tuple(offsets_seconds)
+    if not 1 <= len(offsets) <= _RWKV_RECALL_PROJECTION_MAX_OFFSETS:
+        raise ValueError(
+            f"recall projection needs 1..{_RWKV_RECALL_PROJECTION_MAX_OFFSETS} offsets"
+        )
+    for offset in offsets:
+        if offset is not None and (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not 0 <= offset <= _RWKV_RECALL_PROJECTION_MAX_OFFSET_SECONDS
+        ):
+            raise ValueError(
+                "recall projection offsets must be None or integer seconds "
+                f"in 0..{_RWKV_RECALL_PROJECTION_MAX_OFFSET_SECONDS}"
+            )
+    return offsets
+
+
+def _rwkv_recall_projection_rollovers(at: float, day_cutoff: int) -> int:
+    """Day rollovers between now and `at`, `day_cutoff` being the next one."""
+
+    if at < day_cutoff:
+        return 0
+    return 1 + int(max(0.0, at - day_cutoff) // 86_400)
+
+
+def _rwkv_review_input_shifted(
+    review_input: RwkvReviewInput,
+    seconds: int,
+    rollovers: int,
+) -> RwkvReviewInput:
+    """The same query `seconds` later, `rollovers` scheduler days ahead."""
+
+    if not seconds:
+        return review_input
+    elapsed_seconds = review_input.current_elapsed_seconds
+    elapsed_days = review_input.current_elapsed_days
+    day_offset = review_input.day_offset
+    # All attributes are constructor fields (see the current-elapsed refresh).
+    return type(review_input)(
+        **(
+            vars(review_input)
+            | {
+                "current_elapsed_seconds": (
+                    None
+                    if elapsed_seconds is None
+                    else min(elapsed_seconds + seconds, 0xFFFF_FFFF)
+                ),
+                "current_elapsed_days": (
+                    None if elapsed_days is None else elapsed_days + rollovers
+                ),
+                "day_offset": None if day_offset is None else day_offset + rollovers,
+            }
+        )
+    )
+
+
+def _begin_rwkv_recall_projection(
+    key: tuple[object, ...] | None,
+) -> tuple[Future[dict[str, object]], bool]:
+    future: Future[dict[str, object]] = Future()
+    if key is None:
+        return future, True
+    with _rwkv_recall_projection_lock:
+        existing = _rwkv_recall_projection_in_flight.get(key)
+        if existing is not None:
+            return existing, False
+        _rwkv_recall_projection_in_flight[key] = future
+        return future, True
+
+
+def _finish_rwkv_recall_projection(
+    key: tuple[object, ...] | None,
+    future: Future[dict[str, object]],
+) -> None:
+    if key is None:
+        return
+    with _rwkv_recall_projection_lock:
+        if _rwkv_recall_projection_in_flight.get(key) is future:
+            del _rwkv_recall_projection_in_flight[key]
+
+
+def _rwkv_recall_projection_result_copy(
+    result: dict[str, object],
+) -> dict[str, object]:
+    """Give each coalesced caller its own mutable result."""
+
+    copied = dict(result)
+    if "offsets_seconds" in result:
+        copied["offsets_seconds"] = list(cast(Sequence[int], result["offsets_seconds"]))
+    if "cards" in result:
+        copied["cards"] = [
+            {**card, "recall": list(cast(Sequence[float | None], card["recall"]))}
+            for card in cast(Sequence[dict[str, object]], result["cards"])
+        ]
+    return copied
+
+
+@dataclass
+class _RwkvRecallProjectionStats:
+    chunks: int = 0
+    waits: int = 0
+
+
+def _project_rwkv_recall_with_state(
+    reviewer: object,
+    *,
+    search: str,
+    offsets: Sequence[int | None],
+    day_cutoff: int,
+    state_token: _ReviewerBackendPredictionStateToken,
+    cancel_event: threading.Event | None,
+    stats: _RwkvRecallProjectionStats,
+) -> dict[str, object]:
+    def cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    input_build = _rwkv_review_input_batches_for_search(
+        reviewer=reviewer,
+        search=search,
+        include_suspended_review=False,
+    )
+    if input_build is None:
+        return {"status": "unavailable", "reason": "inputs_unavailable"}
+    input_build = _resolve_dynamic_desired_retentions_for_input_build(
+        reviewer, input_build
+    )
+    taken = time.time()
+    resolved_offsets = [
+        max(1, math.ceil(day_cutoff - taken)) if offset is None else offset
+        for offset in offsets
+    ]
+    rows: dict[int, dict[str, object]] = {}
+    recalls: dict[int, list[float | None]] = {}
+    for card_id, review_input in _rwkv_review_input_build_inputs(input_build):
+        recall: list[float | None] = [None] * len(resolved_offsets)
+        recalls[card_id] = recall
+        rows[card_id] = {
+            "card_id": card_id,
+            "deck_id": review_input.identity.deck_id,
+            "target_retention": _rwkv_review_input_target_retention(review_input),
+            "recall": recall,
+        }
+
+    for offset_index, seconds in enumerate(resolved_offsets):
+        rollovers = _rwkv_recall_projection_rollovers(taken + seconds, day_cutoff)
+        for batch_size, items in input_build.inputs_by_batch_size.items():
+            for chunk_start in range(0, len(items), _RWKV_REVIEW_RESCHEDULE_BATCH_SIZE):
+                if cancelled():
+                    return {"status": "cancelled"}
+                chunk = [
+                    (
+                        card_id,
+                        _rwkv_review_input_shifted(review_input, seconds, rollovers),
+                    )
+                    for card_id, review_input in items[
+                        chunk_start : chunk_start + _RWKV_REVIEW_RESCHEDULE_BATCH_SIZE
+                    ]
+                ]
+                try:
+                    try:
+                        scores = _rwkv_review_scores_for_inputs(
+                            chunk, batch_size=batch_size, state_token=state_token
+                        )
+                    except _ReviewerBackendPredictionBusy:
+                        # Queue behind the reviewer instead of failing the run.
+                        stats.waits += 1
+                        scores = _rwkv_review_scores_for_inputs(
+                            chunk,
+                            batch_size=batch_size,
+                            state_token=state_token,
+                            wait_for_access=True,
+                        )
+                except _ReviewerBackendPredictionAborted:
+                    return {"status": "stale", "reason": "state_changed"}
+                if scores is None:
+                    return {"status": "unavailable", "reason": "scores_unavailable"}
+                if cancelled():
+                    return {"status": "cancelled"}
+                stats.chunks += 1
+                for card_id, score in scores:
+                    card_recall = recalls.get(card_id)
+                    if card_recall is not None:
+                        card_recall[offset_index] = float(score)
+
+    if not _reviewer_backend_prediction_state_token_is_current(state_token):
+        return {"status": "stale", "reason": "state_changed"}
+    return {
+        "status": "ready",
+        "taken": taken,
+        "offsets_seconds": resolved_offsets,
+        "cards": [
+            row
+            for card_id, row in rows.items()
+            if recalls[card_id][0] is not None and row["target_retention"] is not None
+        ],
+    }
+
+
+def project_rwkv_recall(
+    mw: object | None = None,
+    *,
+    search: str = _RWKV_RECALL_PROJECTION_DEFAULT_SEARCH,
+    offsets_seconds: Sequence[int | None] = (0,),
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object]:
+    """Project each matched card's RWKV recall at future times.
+
+    Add-on API (see docs/rwkv.MD, "Recall Projection"). The recall is what the
+    current model state predicts if the user stopped reviewing now; nothing is
+    written and no warm-up is started. Blocking: call it from a background
+    thread that does not hold the collection executor (a plain thread or
+    `run_in_background(..., uses_collection=False)`). `offsets_seconds` are
+    seconds after now; None is the next day rollover. Returns plain data with
+    `status` "ready", "pending", "unavailable", "stale" or "cancelled".
+    """
+
+    if threading.current_thread() is threading.main_thread():
+        raise RuntimeError("project_rwkv_recall blocks; call it off the main thread")
+    offsets = _rwkv_recall_projection_offsets(offsets_seconds)
+    if mw is None:
+        import aqt
+
+        mw = aqt.mw
+    start = time.monotonic()
+    reviewer = SimpleNamespace(mw=mw)
+
+    def stopped(status: str, reason: str | None = None) -> dict[str, object]:
+        logger.debug(
+            "RWKV recall projection %s: reason=%s search=%r offsets=%s elapsed_ms=%.1f",
+            status,
+            reason,
+            search[:120],
+            list(offsets),
+            (time.monotonic() - start) * 1000,
+        )
+        return (
+            {"status": status}
+            if reason is None
+            else {"status": status, "reason": reason}
+        )
+
+    if not configure_reviewer_backend_from_environment() or _reviewer_backend is None:
+        return stopped("unavailable", "backend_unavailable")
+    day_cutoff = getattr(
+        getattr(_collection(reviewer), "sched", None), "day_cutoff", None
+    )
+    if not isinstance(day_cutoff, int) or isinstance(day_cutoff, bool):
+        return stopped("unavailable", "collection_unavailable")
+    # Cache-only readiness: a cold state is reported, never replayed here.
+    if not _prepare_reviewer_backend_for_review(reviewer):
+        return stopped(
+            "pending",
+            "warmup_pending"
+            if _reviewer_backend_warmup_pending(reviewer)
+            else "state_cold",
+        )
+    state_token = _capture_reviewer_backend_prediction_state_token(reviewer)
+    if state_token is None:
+        return stopped("pending", "state_unavailable")
+    state_key = _rwkv_stats_prepare_key(reviewer, search, state_token=state_token)
+    key = (
+        None
+        if state_key is None
+        else (
+            "recall_projection",
+            state_key,
+            tuple(
+                ("rollover", day_cutoff) if offset is None else offset
+                for offset in offsets
+            ),
+        )
+    )
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return stopped("cancelled")
+        future, owns = _begin_rwkv_recall_projection(key)
+        if owns:
+            break
+        while True:
+            try:
+                shared = future.result(timeout=_RWKV_RECALL_PROJECTION_CANCEL_POLL_SECS)
+                break
+            except FutureTimeoutError:
+                if cancel_event is not None and cancel_event.is_set():
+                    return stopped("cancelled")
+        if shared.get("status") == "cancelled":
+            # Another caller cancelled the shared run; this one still wants it.
+            continue
+        logger.debug(
+            "RWKV recall projection reused in-flight result: status=%s cards=%s "
+            "offsets=%s search=%r elapsed_ms=%.1f",
+            shared.get("status"),
+            len(cast(Sequence[object], shared.get("cards", ()))),
+            list(offsets),
+            search[:120],
+            (time.monotonic() - start) * 1000,
+        )
+        return _rwkv_recall_projection_result_copy(shared)
+
+    stats = _RwkvRecallProjectionStats()
+    try:
+        result = _project_rwkv_recall_with_state(
+            reviewer,
+            search=search,
+            offsets=offsets,
+            day_cutoff=day_cutoff,
+            state_token=state_token,
+            cancel_event=cancel_event,
+            stats=stats,
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if result["status"] == "ready":
+            result["elapsed_ms"] = elapsed_ms
+        future.set_result(result)
+    except BaseException as exc:
+        if not future.done():
+            future.set_exception(exc)
+        raise
+    finally:
+        _finish_rwkv_recall_projection(key, future)
+    logger.debug(
+        "RWKV recall projection finished: status=%s reason=%s cards=%s offsets=%s "
+        "chunks=%s waits=%s coalesced=False search=%r elapsed_ms=%.1f",
+        result["status"],
+        result.get("reason"),
+        len(cast(Sequence[object], result.get("cards", ()))),
+        result.get("offsets_seconds", list(offsets)),
+        stats.chunks,
+        stats.waits,
+        search[:120],
+        elapsed_ms,
+    )
+    return _rwkv_recall_projection_result_copy(result) if key is not None else result
 
 
 def _rwkv_simulation_inputs(
@@ -22522,8 +23111,7 @@ def _rwkv_first_review_elapsed_config_key(
 
 
 def _rwkv_model() -> str:
-    # Preferences save the choice for the next profile open. Keep cache identity
-    # and background jobs on the model used by the current resident backend.
+    # Keep cache identity and background jobs on the current resident backend.
     return _rwkv_runtime_models().model
 
 
@@ -22544,13 +23132,13 @@ def _rwkv_runtime_models() -> RwkvRuntimeModels:
     return _rwkv_runtime_models_for_profile(mw)
 
 
-def _rwkv_runtime_models_for_profile(mw: object) -> RwkvRuntimeModels:
+def _rwkv_runtime_models_for_profile(
+    mw: object, *, profile: Mapping[str, object] | None = None
+) -> RwkvRuntimeModels:
     """The runtime models for the open profile and the schedulers its presets use.
 
-    Read when the backend is created (profile open); a later change of the
-    profile opt-out or of the presets' schedulers applies at the next open,
-    except that a preset turning on RWKV-Curve beside an instant-only runtime
-    swaps it at once (refresh_rwkv_runtime_models_after_preset_change()).
+    Read when the backend is created. Saving a different model configuration
+    can replace the backend; a preset enabling RWKV-Curve can also do so.
     """
     from aqt.rwkv_model import (
         curve_model_for_choice,
@@ -22559,11 +23147,12 @@ def _rwkv_runtime_models_for_profile(mw: object) -> RwkvRuntimeModels:
         single_model_for_profile,
     )
 
-    profile = getattr(getattr(mw, "pm", None), "profile", None)
+    if profile is None:
+        profile = getattr(getattr(mw, "pm", None), "profile", None)
     model = model_for_profile(profile)
     if os.environ.get("ANKI_RWKV_MODEL_PATH"):
         # A custom checkpoint serves both schedulers, in place of the
-        # choice's full model (Tiny's is the default small model).
+        # choice's full model (a size's two-head model).
         return RwkvRuntimeModels(curve_model_for_choice(model))
     config_state = _rwkv_collection_config_state(SimpleNamespace(mw=mw))
     return runtime_models(
@@ -22603,13 +23192,13 @@ def _require_rwkv_workload_curve() -> None:
 def refresh_rwkv_runtime_models_after_preset_change(mw: object) -> bool:
     """Drop an instant-only runtime once a preset uses RWKV-Curve.
 
-    The show-time instant-only model, stage 2 (SM98) alone has no curve, so
+    A size's Instant-Only model alone (SM99, SM98 or SM101) has no curve, so
     an RWKV-Curve preset (as scheduler or as RWKV-Instant's fallback) saved
     while it runs would otherwise get FSRS intervals until the next profile
     open. The next backend use creates the runtime the profile now needs
-    (the pair, or the release alone with the opt-out), whose replay key
-    differs, so state rebuilds once. Every other change still waits for the
-    next profile open. Returns whether the backend was dropped.
+    (the pair, or the size's two-head model alone with the opt-out), whose
+    replay key differs, so state rebuilds once. Other preset scheduler changes
+    wait for the next profile open. Returns whether the backend was dropped.
     """
     from aqt.rwkv_srs_benchmark import EmbeddedRwkvReviewerBackend
 
@@ -22639,8 +23228,7 @@ def refresh_rwkv_runtime_models_after_preset_change(mw: object) -> bool:
 
 
 def _rwkv_state_precision() -> str:
-    # Keep the running session's precision stable if Preferences has saved a
-    # different choice for the next restart. Background jobs share this mode.
+    # Background jobs share the running backend's precision until it is replaced.
     precision = getattr(_reviewer_backend, "state_precision", None)
     if isinstance(precision, str):
         return precision
@@ -23547,14 +24135,20 @@ def study_queues_did_change(
 
     _invalidate_resolved_preset_id_cache(transient_reviewer)
     clear_deck_browser_rwkv_count_scores(mw)
-    logger.debug(
-        "RWKV study queue caches invalidated: generation=%s initiator=%s "
-        "resident_state_preserved=%s mutation_reconciled=%s",
-        generation,
-        type(initiator).__name__ if initiator is not None else None,
-        resident_state_preserved,
-        mutation_reconciled,
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "RWKV study queue caches invalidated: generation=%s initiator=%s "
+            "resident_state_preserved=%s mutation_reconciled=%s changes=%s",
+            generation,
+            type(initiator).__name__ if initiator is not None else None,
+            resident_state_preserved,
+            mutation_reconciled,
+            (
+                [field.name for field, value in changes.ListFields() if value is True]
+                if changes is not None
+                else None
+            ),
+        )
 
 
 def _resolve_dynamic_desired_retentions_for_inputs(
@@ -25679,9 +26273,11 @@ def _rwkv_review_scores_for_inputs(
     *,
     batch_size: int,
     state_token: _ReviewerBackendPredictionStateToken | None = None,
+    wait_for_access: bool = False,
 ) -> list[tuple[int, float]] | None:
     with _try_reviewer_backend_prediction_access(
         expected_state_token=state_token,
+        wait_for_access=wait_for_access,
     ) as backend:
         if backend is None:
             logger.debug("RWKV input scoring skipped: backend busy")
@@ -26399,6 +26995,13 @@ def _rwkv_review_input_batches_for_search(
     include_disabled_decks: bool = False,
     track_elapsed_since: bool = False,
 ) -> RwkvReviewInputBatchBuild | None:
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "RWKV review input search requested: search=%r thread=%s caller=%s",
+            search[:120],
+            threading.current_thread().name,
+            debug_caller_chain(traceback.extract_stack(limit=8)[:-1]),
+        )
     if not use_enabled_deck_filter:
         return None
 
