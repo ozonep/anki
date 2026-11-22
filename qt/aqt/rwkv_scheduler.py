@@ -336,6 +336,11 @@ _reviewer_backend_revalidation_candidates: dict[
 ] = {}
 _reviewer_backend_prepared_learning_restarts: dict[tuple[int, int], dict[int, int]] = {}
 _reviewer_backend_warmup_pending_generations: dict[tuple[int, int], int] = {}
+# Keys whose resident state a temporary operation (forecast, simulation,
+# calibration) has taken out. Each operation removes its own key when it ends,
+# so runtime resets leave this set alone.
+_reviewer_backend_temporary_operation_keys: set[tuple[int, int]] = set()
+_RWKV_STATE_CACHE_RECOVERY_DEFERRED_ATTR = "_rwkv_state_cache_recovery_deferred"
 _reviewer_backend_cold_fallback_generations: dict[tuple[int, int], int] = {}
 _rwkv_memorised_history_identity_cache: dict[
     tuple[int, int],
@@ -4058,6 +4063,7 @@ def _claim_reviewer_backend_temporary_operation(
             previous_identity = _reviewer_backend_warmup_states.pop(key, None)
             _rwkv_memorised_history_identity_cache.pop(key, None)
             _reviewer_backend_warmup_pending_generations[key] = generation
+            _reviewer_backend_temporary_operation_keys.add(key)
 
         claimed = True
         return _ReviewerBackendTemporaryOperation(
@@ -4121,6 +4127,79 @@ def _finish_reviewer_backend_temporary_operation(
             )
 
 
+def _end_reviewer_backend_temporary_operation_hold(
+    operation: _ReviewerBackendTemporaryOperation,
+) -> tuple[object, str, bool] | None:
+    """Release the operation's key; return a recovery deferred meanwhile."""
+
+    mw = getattr(operation.reviewer, "mw", None)
+    with _reviewer_backend_state_lock:
+        _reviewer_backend_temporary_operation_keys.discard(operation.key)
+        deferred = getattr(mw, _RWKV_STATE_CACHE_RECOVERY_DEFERRED_ATTR, None)
+        if deferred is None:
+            return None
+        setattr(mw, _RWKV_STATE_CACHE_RECOVERY_DEFERRED_ATTR, None)
+    reason, allow_during_review = deferred
+    return mw, reason, allow_during_review
+
+
+def _defer_rwkv_state_recovery_while_held(
+    mw: object,
+    *,
+    reason: str,
+    allow_during_review: bool,
+) -> bool:
+    """Remember a recovery request while a temporary operation holds the state.
+
+    Recovering now would show a modal dialog whose worker waits on the
+    execution lock until the operation ends, then usually finds the state
+    restored. The operation re-issues the request when it ends instead.
+    """
+
+    with _reviewer_backend_state_lock:
+        key = _reviewer_backend_warmup_key(SimpleNamespace(mw=mw))
+        if key is None or key not in _reviewer_backend_temporary_operation_keys:
+            return False
+        previous = getattr(mw, _RWKV_STATE_CACHE_RECOVERY_DEFERRED_ATTR, None)
+        if previous is not None:
+            allow_during_review = allow_during_review or previous[1]
+        setattr(
+            mw,
+            _RWKV_STATE_CACHE_RECOVERY_DEFERRED_ATTR,
+            (reason, allow_during_review),
+        )
+    logger.debug(
+        "RWKV state recovery deferred while a temporary operation holds the state: reason=%s",
+        reason,
+    )
+    return True
+
+
+def _reissue_deferred_rwkv_state_recovery(
+    mw: object,
+    reason: str,
+    allow_during_review: bool,
+) -> None:
+    def reissue() -> None:
+        logger.info(
+            "RWKV state recovery re-requested after temporary operation: reason=%s",
+            reason,
+        )
+        _request_rwkv_state_cache_recovery(
+            mw,
+            reason=reason,
+            allow_during_review=allow_during_review,
+            refresh_when_ready=True,
+        )
+
+    try:
+        _run_on_main(mw, reissue)
+    except Exception:
+        logger.exception(
+            "failed to re-request deferred RWKV state recovery: reason=%s", reason
+        )
+
+
 @contextmanager
 def _temporary_reviewer_backend_operation(
     reviewer: object,
@@ -4163,15 +4242,23 @@ def _temporary_reviewer_backend_operation(
                     restored=state_safe,
                 )
             finally:
+                deferred_recovery = None
                 try:
-                    _reviewer_backend_execution_lock.release()
+                    deferred_recovery = _end_reviewer_backend_temporary_operation_hold(
+                        operation
+                    )
                 finally:
-                    if previous_prediction_backend is None:
-                        delattr(_reviewer_backend_prediction_local, "backend")
-                    else:
-                        _reviewer_backend_prediction_local.backend = (
-                            previous_prediction_backend
-                        )
+                    try:
+                        _reviewer_backend_execution_lock.release()
+                    finally:
+                        if previous_prediction_backend is None:
+                            delattr(_reviewer_backend_prediction_local, "backend")
+                        else:
+                            _reviewer_backend_prediction_local.backend = (
+                                previous_prediction_backend
+                            )
+                        if deferred_recovery is not None:
+                            _reissue_deferred_rwkv_state_recovery(*deferred_recovery)
 
 
 def configure_reviewer_backend_from_environment() -> bool:
@@ -7504,6 +7591,9 @@ def clear_deck_browser_rwkv_count_scores(mw: object) -> None:
         clear_scores()
 
 
+_RWKV_DECK_BROWSER_STALE_RETRIES = 2
+
+
 def prepare_deck_browser_rwkv_counts_incrementally(
     mw: object,
     deck_ids: Sequence[int],
@@ -7511,8 +7601,14 @@ def prepare_deck_browser_rwkv_counts_incrementally(
     should_continue: Callable[[], bool],
     on_update: Callable[[int, DeckTreeNode | None], None],
     on_done: Callable[[bool], None] | None = None,
+    on_unavailable: Callable[[int, str], None] | None = None,
 ) -> None:
-    """Score deck scopes, reporting if unresolved loading state may be cleared."""
+    """Score deck scopes, reporting if unresolved loading state may be cleared.
+
+    ``on_update(deck_id, None)`` means RWKV does not apply to the scope, so the
+    due-date count is correct. ``on_unavailable(deck_id, reason)`` means RWKV
+    should apply but its count could not be computed.
+    """
 
     reviewer = SimpleNamespace(mw=mw)
     taskman = getattr(mw, "taskman", None)
@@ -7548,13 +7644,23 @@ def prepare_deck_browser_rwkv_counts_incrementally(
         if on_done is not None:
             on_done(clear_pending)
 
-    def fail(stage: str) -> None:
+    def mark_unavailable(deck_id: int, reason: str) -> None:
+        logger.info(
+            "RWKV deck browser count unavailable: deck_id=%s reason=%s",
+            deck_id,
+            reason,
+        )
+        if on_unavailable is not None:
+            on_unavailable(deck_id, reason)
+
+    def fail(stage: str, deck_id: int) -> None:
         if not should_continue():
             logger.debug("RWKV deck browser count %s cancelled", stage)
             finish()
             return
         logger.exception("RWKV deck browser count %s failed", stage)
-        finish(clear_pending=True)
+        mark_unavailable(deck_id, "error")
+        prepare_next_deck()
 
     def prepare_next_deck() -> None:
         if not should_continue():
@@ -7564,7 +7670,9 @@ def prepare_deck_browser_rwkv_counts_incrementally(
         if deck_id is None:
             finish()
             return
+        prepare_deck(deck_id, _RWKV_DECK_BROWSER_STALE_RETRIES)
 
+    def prepare_deck(deck_id: int, retries_left: int) -> None:
         def prepare() -> tuple[RwkvReviewQueueOrderAsyncWork | None, bool]:
             if not should_continue():
                 return None, False
@@ -7584,7 +7692,7 @@ def prepare_deck_browser_rwkv_counts_incrementally(
             try:
                 work, loading = future.result()
             except Exception:
-                fail("preparation")
+                fail("preparation", deck_id)
                 return
             if work is None:
                 if loading:
@@ -7595,7 +7703,10 @@ def prepare_deck_browser_rwkv_counts_incrementally(
                         deck_id,
                     )
                 elif should_continue():
-                    on_update(deck_id, None)
+                    if _rwkv_score_prewarm_applies(reviewer, deck_id):
+                        mark_unavailable(deck_id, "scores_not_prepared")
+                    else:
+                        on_update(deck_id, None)
                 prepare_next_deck()
                 return
             if not should_continue():
@@ -7609,7 +7720,7 @@ def prepare_deck_browser_rwkv_counts_incrementally(
                 try:
                     result = future.result()
                 except Exception:
-                    fail("scoring")
+                    fail("scoring", deck_id)
                     return
                 if not should_continue():
                     finish()
@@ -7796,15 +7907,20 @@ def prepare_deck_browser_rwkv_counts_incrementally(
                     try:
                         tree = future.result()
                     except Exception:
-                        fail("installation")
+                        fail("installation", deck_id)
                         return
-                    if should_continue():
-                        if tree is not None:
-                            updated_scopes += 1
-                            if first_update_elapsed_ms is None:
-                                first_update_elapsed_ms = (
-                                    time.monotonic() - start
-                                ) * 1000
+                    if not should_continue():
+                        prepare_next_deck()
+                        return
+                    if tree is None:
+                        if retries_left > 0:
+                            prepare_deck(deck_id, retries_left - 1)
+                            return
+                        mark_unavailable(deck_id, "stale_after_retries")
+                    else:
+                        updated_scopes += 1
+                        if first_update_elapsed_ms is None:
+                            first_update_elapsed_ms = (time.monotonic() - start) * 1000
                         on_update(result.deck_id, tree)
                     prepare_next_deck()
 
@@ -7815,6 +7931,22 @@ def prepare_deck_browser_rwkv_counts_incrementally(
         run_in_background(prepare, prepared, uses_collection=True)
 
     prepare_next_deck()
+
+
+def _rwkv_score_prewarm_applies(reviewer: object, deck_id: int) -> bool:
+    """Whether RWKV counts are expected for this scope (backend and preset)."""
+
+    if _reviewer_backend is None:
+        configure_reviewer_backend_from_environment()
+    backend = _reviewer_backend
+    if backend is None or not callable(
+        getattr(backend, "cached_review_input_predictions", None)
+    ):
+        return False
+    deck_config = _deck_config_for_deck_id(reviewer, deck_id)
+    return isinstance(deck_config, dict) and _rwkv_review_instant_order_enabled(
+        deck_config
+    )
 
 
 def _begin_rwkv_score_prewarm(key: RwkvScorePrewarmKey) -> bool:
@@ -13104,6 +13236,24 @@ def request_rwkv_state_cache_recovery(
 ) -> bool:
     """Schedule one visible canonical recovery when resident RWKV state is cold."""
 
+    return _request_rwkv_state_cache_recovery(
+        mw,
+        reason=reason,
+        allow_during_review=allow_during_review,
+        refresh_when_ready=False,
+    )
+
+
+def _request_rwkv_state_cache_recovery(
+    mw: object,
+    *,
+    reason: str,
+    allow_during_review: bool,
+    refresh_when_ready: bool,
+) -> bool:
+    """refresh_when_ready schedules the ready-state view refresh, for a request
+    deferred while a temporary operation held the state."""
+
     if getattr(mw, "_rwkv_model_change_pending", None) is not None:
         return False
     reviewer = SimpleNamespace(mw=mw)
@@ -13112,7 +13262,7 @@ def request_rwkv_state_cache_recovery(
         return False
     if not configure_reviewer_backend_from_environment():
         return False
-    if _rwkv_resident_state_ready(mw):
+    if _rwkv_resident_state_ready(mw) and not refresh_when_ready:
         return False
     if getattr(mw, "_rwkv_state_cache_recovery_failed", False):
         logger.debug(
@@ -13125,6 +13275,10 @@ def request_rwkv_state_cache_recovery(
             "RWKV state recovery request suppressed after decline: reason=%s",
             reason,
         )
+        return False
+    if _defer_rwkv_state_recovery_while_held(
+        mw, reason=reason, allow_during_review=allow_during_review
+    ):
         return False
     if getattr(mw, "_rwkv_state_cache_loading", False) or getattr(
         mw,
@@ -13186,6 +13340,10 @@ def request_rwkv_state_cache_recovery(
                 "RWKV state recovery request suppressed after decline: reason=%s",
                 reason,
             )
+            return
+        if _defer_rwkv_state_recovery_while_held(
+            mw, reason=reason, allow_during_review=allow_during_review
+        ):
             return
         logger.info("RWKV state recovery starting: reason=%s", reason)
         try:
