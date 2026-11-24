@@ -222,6 +222,14 @@ _RWKV_CURVE_DUE_SEARCH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_:-])-?is:rwkv-curve:due(?![A-Za-z0-9_:-])",
     re.IGNORECASE,
 )
+# Plain `is:due`, which follows RWKV-Instant for cards whose preset uses it.
+_SMART_DUE_SEARCH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_:-])-?is:due(?![A-Za-z0-9_:-])",
+    re.IGNORECASE,
+)
+# Mirrors rslib's RWKV_FILTERED_BUILD_SNAPSHOT_KEY: scores published under it
+# serve the next filtered deck build only.
+RWKV_FILTERED_BUILD_SNAPSHOT_KEY = "rwkv:filtered-deck-build"
 _FILTERED_DECK_RETRIEVABILITY_ORDERS = frozenset(
     (
         FilteredDeckConfig.SearchTerm.RETRIEVABILITY_ASCENDING,
@@ -895,7 +903,10 @@ class _ReviewerBackendTemporaryOperation:
 
 
 class _ReviewerBackendWarmupInvalidated(Exception):
-    pass
+    # Callers convert this to InterruptedError; the message covers any that
+    # escapes so a UI never shows only the class name.
+    def __init__(self, message: str = "RWKV state changed; run it again") -> None:
+        super().__init__(message)
 
 
 class _RwkvGradeNowReconciliationUnavailable(Exception):
@@ -6706,13 +6717,41 @@ def _search_uses_rwkv_curve_retrievability(search: str) -> bool:
     return _RWKV_CURVE_R_SEARCH_PATTERN.search(search) is not None
 
 
+def _search_uses_smart_due(search: str) -> bool:
+    return _SMART_DUE_SEARCH_PATTERN.search(search) is not None
+
+
+def rwkv_instant_due_enabled(reviewer: object) -> bool:
+    """Return whether some preset uses RWKV-Instant, so `is:due` needs scores."""
+
+    return _rwkv_collection_config_state(reviewer).instant_enabled
+
+
+def _search_needs_smart_due_scores(reviewer: object, search: str) -> bool:
+    # Read deck configs only for searches that use `is:due`.
+    return _search_uses_smart_due(search) and rwkv_instant_due_enabled(reviewer)
+
+
 def search_uses_rwkv_retrievability(search: str) -> bool:
-    """Return whether a Browser search needs an RWKV score snapshot."""
+    """Return whether a search uses an RWKV retrievability property."""
 
     return bool(
         _RWKV_INSTANT_R_SEARCH_PATTERN.search(search)
         or _RWKV_CURVE_R_SEARCH_PATTERN.search(search)
     )
+
+
+def search_needs_rwkv_scores(mw: object, search: str) -> bool:
+    """Return whether a Browser search needs RWKV scores prepared for it."""
+
+    if (
+        search_uses_rwkv_retrievability(search)
+        or _search_uses_rwkv_instant_due(search)
+        or _search_uses_rwkv_curve_due(search)
+    ):
+        return True
+    reviewer = getattr(mw, "reviewer", None) or SimpleNamespace(mw=mw)
+    return _search_needs_smart_due_scores(reviewer, search)
 
 
 def prepare_browser_retrievability_scores(
@@ -6735,10 +6774,19 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
     prepare_instant_due: bool = False,
     prepare_curve_due: bool = False,
     prepare_curve_retrievability: bool = False,
+    snapshot_key: str | None = None,
 ) -> RwkvStatsPreparationStatus:
-    """Prepare transient RWKV scores, waiting for backend access for filtered decks."""
+    """Prepare transient RWKV scores, waiting for backend access for filtered decks.
 
-    prepare_instant_due = prepare_instant_due or _search_uses_rwkv_instant_due(search)
+    Scores are published under `snapshot_key`, or under `search` by default.
+    """
+
+    prepare_instant_due = (
+        prepare_instant_due
+        or _search_uses_rwkv_instant_due(search)
+        or _search_needs_smart_due_scores(reviewer, search)
+    )
+    publish_key = search if snapshot_key is None else snapshot_key
     prepare_curve_due = prepare_curve_due or _search_uses_rwkv_curve_due(search)
     prepare_curve_retrievability = (
         prepare_curve_retrievability or _search_uses_rwkv_curve_retrievability(search)
@@ -6754,7 +6802,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             (time.monotonic() - configure_start) * 1000,
         )
     if _reviewer_backend is None:
-        _set_rwkv_stats_graph_scores(reviewer, search, [])
+        _set_rwkv_stats_graph_scores(reviewer, publish_key, [])
         return RwkvStatsPreparationStatus.UNAVAILABLE
 
     start = time.monotonic()
@@ -6838,7 +6886,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             warmup_elapsed_ms,
         )
         if not warmed_up:
-            _set_rwkv_stats_graph_scores(reviewer, search, [])
+            _set_rwkv_stats_graph_scores(reviewer, publish_key, [])
             logger.debug(
                 "RWKV stats retrievability scoring skipped: warm-up pending search=%r",
                 search,
@@ -6868,7 +6916,7 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             return stopped("state_unavailable")
         prepare_key = _rwkv_stats_prepare_key(
             reviewer,
-            search,
+            search if snapshot_key is None else f"{snapshot_key}\n{search}",
             state_token=state_token,
             prepare_instant_due=prepare_instant_due,
             prepare_curve_due=prepare_curve_due,
@@ -6932,9 +6980,10 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
             set_start = time.monotonic()
             if not _set_rwkv_stats_graph_scores_if_current(
                 reviewer,
-                search,
+                publish_key,
                 scores,
                 state_token=state_token,
+                instant_due=prepare_instant_due,
                 target_retentions_by_card_id=(
                     search_score_result.target_retentions_by_card_id
                 ),
@@ -7002,9 +7051,10 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
         set_start = time.monotonic()
         if not _set_rwkv_stats_graph_scores_if_current(
             reviewer,
-            search,
+            publish_key,
             scores,
             state_token=state_token,
+            instant_due=prepare_instant_due,
         ):
             if _reviewer_backend_prediction_state_token_is_current(state_token):
                 prepare_status = RwkvStatsPreparationStatus.PENDING
@@ -7049,11 +7099,11 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
         )
         if state_token is None:
             if _rwkv_stats_prepare_generation_is_current(prepare_generation):
-                _set_rwkv_stats_graph_scores(reviewer, search, [])
+                _set_rwkv_stats_graph_scores(reviewer, publish_key, [])
         else:
             _set_rwkv_stats_graph_scores_if_current(
                 reviewer,
-                search,
+                publish_key,
                 [],
                 state_token=state_token,
             )
@@ -7070,14 +7120,23 @@ def prepare_stats_retrievability_scores(  # noqa: PLR0911
                 )
 
 
-def filtered_deck_rwkv_need(config: FilteredDeckConfig) -> FilteredDeckRwkvNeed:
-    """Classify RWKV use in the active filters, with membership taking priority."""
+def filtered_deck_rwkv_need(
+    config: FilteredDeckConfig,
+    *,
+    instant_due_enabled: bool = False,
+) -> FilteredDeckRwkvNeed:
+    """Classify RWKV use in the active filters, with membership taking priority.
+
+    With `instant_due_enabled` (some preset uses RWKV-Instant), `is:due` needs
+    RWKV scores too.
+    """
 
     terms = [term for term in config.search_terms[:2] if term.limit > 0]
     if any(
         search_uses_rwkv_retrievability(term.search)
         or _search_uses_rwkv_instant_due(term.search)
         or _search_uses_rwkv_curve_due(term.search)
+        or (instant_due_enabled and _search_uses_smart_due(term.search))
         for term in terms
     ):
         return FilteredDeckRwkvNeed.SEARCH
@@ -7095,14 +7154,20 @@ def prepare_filtered_deck_retrievability_scores(
     """Prepare RWKV scores needed by a filtered deck's filters and ordering."""
 
     terms = [term for term in config.search_terms[:2] if term.limit > 0]
-    prepare_instant_due = any(
+    smart_due = any(
+        _search_uses_smart_due(term.search) for term in terms
+    ) and rwkv_instant_due_enabled(reviewer)
+    prepare_instant_due = smart_due or any(
         _search_uses_rwkv_instant_due(term.search) for term in terms
     )
     prepare_curve_due = any(_search_uses_rwkv_curve_due(term.search) for term in terms)
     prepare_curve_retrievability = any(
         _search_uses_rwkv_curve_retrievability(term.search) for term in terms
     )
-    if filtered_deck_rwkv_need(config) is FilteredDeckRwkvNeed.NONE:
+    if (
+        filtered_deck_rwkv_need(config, instant_due_enabled=smart_due)
+        is FilteredDeckRwkvNeed.NONE
+    ):
         return None
 
     col = _collection(reviewer)
@@ -7134,6 +7199,7 @@ def prepare_filtered_deck_retrievability_scores(
         prepare_instant_due=prepare_instant_due,
         prepare_curve_due=prepare_curve_due,
         prepare_curve_retrievability=prepare_curve_retrievability,
+        snapshot_key=RWKV_FILTERED_BUILD_SNAPSHOT_KEY,
     )
 
 
@@ -15482,6 +15548,9 @@ _RWKV_FORECAST_SCHEDULER_NAMES = {
 }
 _RWKV_FORECAST_BAND_KEYS = ("mean", "p1", "p5", "p50", "p95", "p99")
 _RWKV_FORECAST_METRICS = ("due", "done", "new", "lapses", "seconds")
+# Instant path counts that run stratified answer outcomes: z = (i - c) / c
+# for path i and c = (paths - 1) / 2, so the outer paths stay at -1 and +1.
+_RWKV_FORECAST_STRATIFIED_PATHS = frozenset((3, 5, 7))
 # Sampled historical days: minimum answers (with a fallback of two when fewer
 # than the minimum number of days qualify) and shrinkage strengths.
 _RWKV_FORECAST_POOL_MIN_ANSWERS = 10
@@ -16091,7 +16160,7 @@ def _rwkv_forecast_prepare_review_time(
         sum(grade is not None for grade in model.grades) if model else 0,
     )
     calibration = None
-    if paths == 3:
+    if paths in _RWKV_FORECAST_STRATIFIED_PATHS:
         calibration_started = time.monotonic()
         calibration = _rwkv_forecast_calibration(
             backend, history, report_progress, paths, replayed
@@ -16444,7 +16513,7 @@ def forecast_rwkv_workload(
                         "cards": len(cards),
                         "model": "instant",
                     }
-                    if paths == 3:
+                    if paths in _RWKV_FORECAST_STRATIFIED_PATHS:
                         partial_metadata["scenario_kind"] = "stratified"
                         if calibration:
                             partial_metadata["scenario_history_days"] = calibration.days
@@ -16529,7 +16598,7 @@ def forecast_rwkv_workload(
                                     calibration.review_variance if calibration else 0.0
                                 ),
                             }
-                            if paths == 3
+                            if paths in _RWKV_FORECAST_STRATIFIED_PATHS
                             else {}
                         ),
                         **({"day_progress": report_day} if partial_progress else {}),
@@ -16552,11 +16621,11 @@ def forecast_rwkv_workload(
                         review_model=review_model,
                         progress=report_progress,
                     )
+                operation.require_current()
             except _ReviewerBackendWarmupInvalidated as exc:
                 raise InterruptedError(
                     "RWKV workload forecast invalidated by state change"
                 ) from exc
-            operation.require_current()
     result = _rwkv_forecast_result(output, cards, days=days, seed=seed)
     if instant_used:
         result["review_time_model"] = (
@@ -16564,7 +16633,7 @@ def forecast_rwkv_workload(
         )
         if review_time_model:
             result["review_time_samples"] = review_time_model.samples
-    if instant_used and paths == 3:
+    if instant_used and paths in _RWKV_FORECAST_STRATIFIED_PATHS:
         result["scenario_kind"] = "stratified"
         if calibration:
             result["scenario_history_days"] = calibration.days
@@ -16811,6 +16880,9 @@ def _rwkv_partial_forecast_result(partial: _RwkvForecastPartial) -> dict[str, ob
         "scenario_sigma" in partial.metadata
         or partial.metadata.get("scenario_kind") == "stratified"
     )
+    # Scenario paths run from low to high; the central one is reported first.
+    path_count = int(cast(int, partial.metadata.get("paths", 3)))
+    central = (path_count - 1) // 2
     daily: list[dict[str, object]] = []
     scenario_daily: list[dict[str, object]] = []
 
@@ -16833,7 +16905,7 @@ def _rwkv_partial_forecast_result(partial: _RwkvForecastPartial) -> dict[str, ob
         }
 
     for day, samples in sorted(partial.rows.items()):
-        if not samples or (is_scenario and 1 not in samples):
+        if not samples or (is_scenario and central not in samples):
             continue
         daily.append(
             {
@@ -16851,7 +16923,7 @@ def _rwkv_partial_forecast_result(partial: _RwkvForecastPartial) -> dict[str, ob
                     **{
                         metric: [
                             samples[path][index] if path in samples else None
-                            for path in range(3)
+                            for path in range(path_count)
                         ]
                         for index, metric in enumerate(_RWKV_FORECAST_METRICS)
                     },
@@ -29476,6 +29548,7 @@ def _set_rwkv_stats_graph_scores(
     intervening_reviews_by_card_id: Mapping[int, int] | None = None,
     curve_due_card_ids: AbstractSet[int] = frozenset(),
     curve_retrievabilities_by_card_id: Mapping[int, float] | None = None,
+    instant_due: bool = False,
     collection_backend: object | None = None,
 ) -> None:
     if collection_backend is None:
@@ -29515,6 +29588,7 @@ def _set_rwkv_stats_graph_scores(
     set_scores(
         search=search,
         scores=score_messages,
+        instant_due=instant_due,
     )
 
 
@@ -29528,6 +29602,7 @@ def _set_rwkv_stats_graph_scores_if_current(
     intervening_reviews_by_card_id: Mapping[int, int] | None = None,
     curve_due_card_ids: AbstractSet[int] = frozenset(),
     curve_retrievabilities_by_card_id: Mapping[int, float] | None = None,
+    instant_due: bool = False,
 ) -> bool:
     """Publish stats only while the complete prediction state is unchanged."""
 
@@ -29555,6 +29630,7 @@ def _set_rwkv_stats_graph_scores_if_current(
                 intervening_reviews_by_card_id=intervening_reviews_by_card_id,
                 curve_due_card_ids=curve_due_card_ids,
                 curve_retrievabilities_by_card_id=(curve_retrievabilities_by_card_id),
+                instant_due=instant_due,
                 collection_backend=state_token.collection_backend,
             )
         return True

@@ -572,6 +572,7 @@ Desktop-only RWKV review settings are stored in deck config `other` under the
 `rwkv_review_min_elapsed_secs`, which defaults to `30`, and
 `rwkv_review_instant_order_enabled`, which defaults to `false`, and
 `rwkv_review_minimum_reviews_per_day`, which defaults to `0`, and
+`rwkv_review_new_cards_ignore_minimum_reviews`, which defaults to `false`, and
 `rwkv_review_candidate_refresh_enabled`, which defaults to `false`, and
 `rwkv_review_precompute_next_card`, which defaults to `true`, and
 `rwkv_review_dynamic_preset_replay`, which defaults to `false`, and
@@ -587,8 +588,13 @@ The former `rwkv_review_allow_same_day_review` field is retained for storage
 compatibility but no longer affects scheduling or hides the repeat-spacing
 fields. The two spacing minimums appear in one row with units inside the fields.
 
-The RWKV card keeps minimum daily reviews, repeat spacing, Curve intervals and
-maintenance actions visible. Its initially collapsed **Advanced** section contains
+With Instant enabled, **Daily Limits** shows **Minimum reviews per day**,
+**New cards ignore minimum reviews** and **Also honor subdeck minimums** in both
+layouts: inline in the modern layout, and right after **Maximum reviews/day** in
+the classic layout. **New cards ignore minimum reviews** is greyed out while the
+minimum is 0; its saved value is kept. Their help entries appear in the Daily
+Limits help only while Instant is enabled. The RWKV card keeps repeat spacing,
+Curve intervals and maintenance actions visible. Its initially collapsed **Advanced** section contains
 the profile-wide model switch and **Compare RWKV with FSRS**. With Instant enabled,
 it also contains **Precompute next card before this card answer**, **Use faster,
 approximate queue updates**, and **Update the RWKV queue every**; these settings
@@ -1177,6 +1183,31 @@ configured display order. Ordinary maximum review limits, sibling burying, and
 same-day/repeat-spacing guards still take precedence. Limit-exempt same-day
 repeats may bypass the maximum, but do not satisfy the minimum.
 
+Reviews pulled forward only to reach the minimum normally use the review limit
+before new cards are gathered. When the review limit also applies to new cards
+(**New cards ignore review limit** off), a minimum as large as the maximum can
+therefore leave no new cards. `rwkv_review_new_cards_ignore_minimum_reviews`
+(**New cards ignore minimum reviews**, off by default) reverses this for the
+selected deck's preset: new cards are gathered right after the reviews RWKV
+considers due, so they take their share of the daily limits first, and the
+minimum only fills the review capacity left after them. In the main queue those
+minimum reviews follow the new cards and the merged due reviews and interday
+learning, whichever new-card mix is selected; with **Mix with reviews**, new
+cards are spread only across the due reviews. New cards never count toward the
+minimum, and maximum limits still take precedence. Review counts in the
+reviewer still include the minimum reviews. Deck browser counts follow the
+same order: interday learning, due reviews, new cards, then minimum reviews in
+the review capacity that remains. The deck-options session preview uses the
+same queue builder. Instant workload forecasts follow the same rule: they select
+due reviews, then new cards, then minimum reviews, and queue the minimum reviews
+after the new-card mix. With **Show new cards before reviews**, the main queue is
+new cards, due reviews merged with interday learning, then minimum reviews.
+The split is recalculated at every queue rebuild. Reviews that become due during
+the session are due reviews, so they are placed before the remaining new cards
+when new cards are shown after reviews, and when the review limit also applies
+to new cards they can reduce the number of new cards. They never make the result
+worse than with the option off.
+
 The deck-specific **Also honor subdeck minimums** option is off by default.
 When enabled, the selected deck also enforces the minimum of each direct
 subdeck. Each of those subdecks independently decides whether to enforce its own
@@ -1326,6 +1357,24 @@ count-only cache. This keeps startup responsive while allowing every displayed
 RWKV scope to converge to its RWKV eligibility counts before the reviewer is
 opened.
 
+RWKV-Instant review counts also show how many reviews the daily limit still
+allows today, for example `50 (≤100)`. The grey `(≤N)` label appears beside the
+review count in the reviewer's bottom bar, the deck overview and the deck list.
+N is the review count plus the review slots the deck's daily review limit still
+leaves after the cards studied today and, when new cards count toward the review
+limit, the new cards shown. In the deck list each RWKV-Instant row uses its own
+study scope and limits. The tooltip explains that more cards can become due as
+recall drops; in the reviewer and the overview it also says how many due reviews
+are waiting for spacing between reviews. The label takes the place of the `(/N)`
+total in the reviewer and the deck list. It is hidden when no slots remain,
+while the review count is pending, when due counts are turned off (reviewer and
+overview), and when the daily review limit is effectively unlimited: 9999 or
+more, the setting's maximum, including the limit of any parent deck that
+applies. Cards reviewed earlier today in a deck where same-day reviews ignore
+the review limit use no review slots, so more reviews than N can still happen. N
+is a ceiling set by the limit, not a forecast of how many cards will actually
+drop below their retention target.
+
 When the desktop Dynamic Desired Retention provider is available, RWKV review
 inputs are resolved before queue scoring or RWKV rescheduling predictions are
 made. Batches use its bulk API; single-card work uses its single-card API when
@@ -1392,8 +1441,18 @@ not depend on a previously selected deck, Card Info, Stats, or background deck
 count calculation. Cards without an applicable current prediction do not match
 the explicit RWKV property.
 
-Filtered decks support two explicit RWKV due predicates without changing the
-meaning of `is:due`:
+Searches support two explicit RWKV due predicates, and `is:due` follows
+RWKV-Instant per card:
+
+- `is:due` keeps its learning and day-learning branches. A review card uses
+  `is:rwkv:due` below when its home preset (original deck for a card in a
+  filtered deck) has `rwkv_review_instant_order_enabled` and the search's
+  prepared scores include the card; otherwise it uses its stored due date or
+  review step. RWKV-Curve-only presets keep due dates. The deck-wide daily
+  minimum is not added. Without a preset that enables RWKV-Instant, `is:due`
+  does not prepare RWKV scores.
+- `is:fsrs:due` is the previous `is:due`: stored due dates and review steps
+  only.
 
 - `is:rwkv:due` matches review cards whose source deck has
   `rwkv_review_instant_order_enabled` and whose fresh RWKV-Instant score passes
@@ -1407,11 +1466,32 @@ meaning of `is:due`:
   review has reached the current/query RWKV-Curve interval at the resolved
   target retention.
 
-Desktop filtered-deck creation and rebuilding detect these predicates, warm the
-RWKV backend, and prepare fresh scores before the final search. Cards without a
-fresh applicable prediction do not match either predicate. Candidate discovery
-temporarily broadens the RWKV-dependent predicates so future cards that the
-model considers due are not omitted before scoring.
+Desktop filtered-deck creation and rebuilding, and custom study of due cards,
+detect these predicates (and `is:due` when a preset enables RWKV-Instant), warm
+the RWKV backend, and prepare fresh scores before the final search. Cards
+without a fresh applicable prediction do not match either predicate. Candidate
+discovery temporarily broadens the RWKV-dependent predicates, including
+`is:due`, so future cards that the model considers due are not omitted before
+scoring.
+
+Each search uses only scores prepared for it. Browser and `find_cards` searches
+use the newest score snapshot whose normalized search text equals the search;
+the snapshot must carry RWKV-Instant inputs (`instant_due`) for `is:due` and
+`is:rwkv:due` to use it. The Browser prepares one before running a search with
+`prop:rwkv:r`, `prop:rwkv-curve:r`, `is:rwkv:due`, `is:rwkv-curve:due`, or (with
+an RWKV-Instant preset) `is:due`; if preparation does not finish, the search
+still runs, `is:due` uses due dates and the RWKV predicates match nothing.
+Filtered-deck preparation publishes its scores under a reserved key; the next
+build takes them for all its filters, and later builds do not reuse them. Other
+searches (for example FSRS preset rules) find no snapshot. A search that needed
+RWKV-Instant scores but found none logs one INFO line when such presets exist.
+
+Known differences from deck-list counts: the deck list applies the selected
+deck's preset to every card in its tree, while searches use each card's home
+preset; the deck list leaves out cards currently in a filtered deck, while
+`deck:X is:due` includes them through their original deck; and the deck list
+counts intervening reviews over the selected deck's tree, while search scores
+count them over each card's home deck tree.
 
 Filtered-deck preparation waits on its collection worker for concurrent RWKV
 predictions to release the resident backend, then holds that access through
@@ -1815,7 +1895,10 @@ including future-due cards and the daily minimum's pull-forward rule; the
 untrained Instant-only curve head is not used. The selected study deck's review
 minimum, its recursively enabled subdeck minimums, each deck's maximum, today's
 counts, and the new-card limit and **New cards ignore review limit** setting
-are applied through Anki's limit tree. A selected deck's ancestor maximums
+are applied through Anki's limit tree. When the study preset enables **New cards
+ignore minimum reviews**, new cards reserve their limits before the daily-minimum
+pass and the minimum reviews are queued after the new-card mix, as in the live
+queue. A selected deck's ancestor maximums
 participate when **Limits start from top** is enabled. A search spanning
 independent deck trees applies each tree's maximums separately. Cards in
 non-Instant trees retain normal due-date eligibility. For a search spanning
@@ -2004,14 +2087,20 @@ so adjusted durations are estimates rather than a rescheduled timeline. The
 available and `"historical"` otherwise; `review_time_samples` counts the
 eligible fitted answers when a model is present.
 
-With exactly three Instant paths, the API runs lower, central and higher
-paths with the same historical sessions and the model's unmodified recall
-probabilities, and a different target for each path's daily answer outcomes.
+With three, five or seven Instant paths, the API runs stratified paths, from
+the lowest to the highest aggregate answer outcome, with the same historical
+sessions and the model's unmodified recall probabilities, and a different
+target for each path's daily answer outcomes.
 All days have the same weight: a simulated day lasts until the queue is empty
 or the limits are hit, so the length of the sampled historical session does not
 predict that day's answer count. Each path shares one set of daily noise, which
-sums to zero, plus a shift that separates the paths by one standard deviation of
-the aggregate answer outcome. The shift is allocated with a cumulative
+sums to zero, plus a shift toward the path's target deviation `z` of the
+aggregate answer outcome, in standard deviations. With `N` paths and
+`c = (N - 1) / 2`, path `i` targets `z = (i - c) / c`: -1, 0, +1 for three
+paths; -1, -1/2, 0, +1/2, +1 for five; and -1, -2/3, -1/3, 0, +1/3, +2/3, +1
+for seven. The outer paths stay one standard deviation from the central one
+whatever the count; more paths add evenly spaced scenarios in between. The
+shift is allocated with a cumulative
 envelope, `sqrt(scale^2 * t + kappa^2 * t^2 / days)` after `t` days, so the
 separation of the paths at any day equals the one-sigma spread of the
 cumulative residual up to that day. A linear allocation would make the bands
@@ -2047,14 +2136,32 @@ true aggregate standard deviation when the calibration is right.
 
 What the spread covers: answer-outcome randomness and systematic recall error.
 It does not cover the per-day range of `done`, `new`, `lapses` and `seconds`
-that comes from the queue, the limits and the sampled days; three paths are not
-enough to estimate that, and at least 100 independent paths are needed. It is an
-approximation, not a calibrated probability interval for workload. In
-particular, the recurrent model and changing queues can make workload paths
-cross or produce a large spread.
+that comes from the queue, the limits and the sampled days; three to seven paths
+are not enough to estimate that, and at least 100 independent paths are needed. It is an
+approximation, not a calibrated probability interval for workload.
+
+Lapses follow the answer outcome closely, but `due` and the other workload
+metrics are not necessarily ordered by it. Every simulated answer updates the
+recurrent model's state, so paths that answer differently soon score cards
+differently, reach different cards under the daily limits and count different
+cards as due. Many review cards sit close to desired retention, and a small
+shift of the state moves hundreds of them in or out of `due`. With five or
+seven paths, neighbouring scenarios usually differ by less than this variation
+between sessions, so their daily `due` values often cross, and the central path
+can be the lowest or the highest. Three paths are ordered more often, but not
+always. On one tested collection (7 paths, 7 days, about 10,000 review cards),
+about 80% of path pairs were in order on a given day and no day had all seven
+in order, while lapses were in order for over 90% of pairs. The variation is
+real: making the paths answer the same cards would order them, but they would
+no longer be sessions Anki could show, and counting `due` as a snapshot or as
+an average over the day removed only a small part of it. Read several paths as
+a range of workload, not as a ranking by answer outcome.
 The API adds `scenario_kind: "stratified"`, `scenario_history_days` and
 `scenario_bias_sd` when calibration succeeds, and `scenario_daily`; each
-metric's array is in `[lower, central, higher]` answer-outcome order. `daily`
+metric's array has one value per path, ordered from the lowest to the highest
+answer outcome (`[lower, central, higher]` for three paths), and the central
+scenario is at index `(paths - 1) / 2`. In a partial result, a path that has not
+reported that day yet is `null`; a day appears once its central path reports. `daily`
 and `groups` retain their existing summary format; consumers should use the
 middle scenario for the central line rather than assume it is the median. If
 calibration is not available, `scenario_calibration` is `"insufficient_history"`.
