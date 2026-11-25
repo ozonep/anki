@@ -1,15 +1,16 @@
 # Fork-only build of the Apple Silicon (ARM64) DMG.
 #
-# Builds a commit of the FSRS7 fork (JSchoreels/anki by default) on a
-# GitHub-hosted Apple Silicon runner and publishes the DMG as a release of this
-# repository. It lives in its own file so that pulling upstream changes never
-# conflicts with it; release.yml stays untouched.
+# Builds a commit of this repository (by default) on a GitHub-hosted Apple
+# Silicon runner and publishes the DMG as a release of this repository. It lives
+# in its own file so that pulling upstream changes never conflicts with it;
+# release.yml stays untouched.
 #
-# - Scheduled runs build upstream main when it has a commit with no release here
-#   yet. If upstream CI already failed for it, the run skips it; if CI is still
-#   running, the build starts anyway and only publishing waits for CI.
-# - Manual runs can build any repository/ref, skip the CI gate, force a rebuild,
-#   or fall back to the macos-15 image.
+# - Scheduled runs build this repository's main when it has a commit with no
+#   release here yet. They don't wait for CI, since ci.yml is disabled here.
+# - Manual runs can build any repository/ref (e.g. JSchoreels/anki), opt in to
+#   the CI gate, force a rebuild, or fall back to the macos-15 image. With the
+#   CI gate on, the build starts while CI is still running and only publishing
+#   waits for it.
 #
 # Builds are ad-hoc signed, not notarized. A browser download gets quarantined
 # by Gatekeeper; downloading with `gh release download` does not.
@@ -20,17 +21,17 @@
 # version compare as older, so only a new base version (e.g. 26.10) prompts.
 
 name: macOS ARM64 build
-run-name: "macOS ARM64 build of ${{ inputs['source-repo'] || 'JSchoreels/anki' }}@${{ inputs['source-ref'] || 'main' }}"
+run-name: "macOS ARM64 build of ${{ inputs['source-repo'] || github.repository }}@${{ inputs['source-ref'] || 'main' }}"
 
 on:
   schedule:
-    # Only the few-second resolve job runs unless upstream main has moved.
+    # Only the few-second resolve job runs unless main has moved.
     - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       source-repo:
         description: "Repository to build"
-        default: JSchoreels/anki
+        default: ozonep/anki
         required: true
         type: string
       source-ref:
@@ -39,8 +40,8 @@ on:
         required: true
         type: string
       wait-for-ci:
-        description: "Publish only after the source repository's CI passes on this commit"
-        default: true
+        description: "Publish only after the source repository's CI passes on this commit (ci.yml is disabled in ozonep/anki, so leave off for it)"
+        default: false
         type: boolean
       force:
         description: "Build and publish even if this commit already has a release"
@@ -62,7 +63,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_REPO: ${{ inputs['source-repo'] || 'JSchoreels/anki' }}
+  SOURCE_REPO: ${{ inputs['source-repo'] || github.repository }}
   SOURCE_REF: ${{ inputs['source-ref'] || 'main' }}
   N2_OUTPUT_PROGRESS: "1"
   N2_OUTPUT_SUCCESS: "1"
@@ -81,7 +82,7 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          WAIT_FOR_CI: ${{ github.event_name == 'schedule' || inputs['wait-for-ci'] }}
+          WAIT_FOR_CI: ${{ inputs['wait-for-ci'] == true }}
           FORCE: ${{ inputs.force == true }}
           SCHEDULED: ${{ github.event_name == 'schedule' }}
         run: |
@@ -152,7 +153,7 @@ jobs:
             echo "- Source: [$SOURCE_REPO@${sha:0:9}](https://github.com/$SOURCE_REPO/commit/$sha)"
             echo "- Release tag: \`$tag\`"
             echo "- Build: $build"
-            echo "- Upstream CI: $ci"
+            echo "- Source CI: $ci"
           } >> "$GITHUB_STEP_SUMMARY"
 
           {
@@ -162,7 +163,7 @@ jobs:
             echo "ci=$ci"
           } >> "$GITHUB_OUTPUT"
 
-  # Runs alongside the build when upstream CI had not finished at resolve time.
+  # Runs alongside the build when source CI had not finished at resolve time.
   ci:
     needs: resolve
     if: needs.resolve.outputs.ci == 'pending'
@@ -278,7 +279,7 @@ jobs:
               echo "Changes since the previous build: https://github.com/$SOURCE_REPO/compare/$prev...$SHA"
             fi
             echo
-            echo "Upstream CI: $CI_STATE. Ad-hoc signed and not notarized. Download it without"
+            echo "Source CI: $CI_STATE. Ad-hoc signed and not notarized. Download it without"
             echo "the Gatekeeper quarantine that a browser download gets:"
             echo
             echo '```'
